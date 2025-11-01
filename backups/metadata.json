@@ -1,0 +1,10 @@
+{
+  "app-20251021-011848.db": {
+    "memo": "계좌잔액/정산",
+    "pending_card_statements": 0
+  },
+  "app-20251021-025903.db": {
+    "memo": "정기규칙생성",
+    "pending_card_statements": 0
+  }
+}
