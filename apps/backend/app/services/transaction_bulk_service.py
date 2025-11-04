@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import or_
 from app import models, schemas
 from app.services.transfer_pairing_service import TransferPairingService
+from app.services.transaction_service import TransactionBalanceService
 from app.utils.normalization import normalize_account_ref, normalize_account_token
 
 
@@ -37,6 +38,7 @@ class TransactionBulkService:
         """
         self.db = db
         self.pairing_service = pairing_service or TransferPairingService()
+        self.balance_service = TransactionBalanceService(db)
     
     def bulk_create(
         self,
@@ -217,6 +219,12 @@ class TransactionBulkService:
             return abs(a_sec - b_sec) <= time_tolerance_seconds
 
         def _is_match(new: schemas.TransactionCreate, existing: models.Transaction) -> bool:
+            try:
+                print(
+                    f"[db-transfer-cand] new_ft=({getattr(new,'from_account_id',None)},{getattr(new,'to_account_id',None)}), ex_ft=({getattr(existing,'from_account_id',None)},{getattr(existing,'to_account_id',None)}), ex_legacy=({getattr(existing,'account_id',None)},{getattr(existing,'counter_account_id',None)})"
+                )
+            except Exception:
+                pass
             # 통화는 쿼리에서 이미 일치
             # 금액: 부호 반대 + 절대값 차이 허용
             if not (new.amount and existing.amount is not None):
@@ -226,14 +234,37 @@ class TransactionBulkService:
             if abs(abs(float(new.amount)) - abs(float(existing.amount))) > amount_tolerance:
                 return False
             # 시간 근접성
-            if not _time_close(new.occurred_time, existing.occurred_time):
+            time_ok = _time_close(new.occurred_time, existing.occurred_time)
+            if not time_ok:
                 return False
             
             # 계좌 힌트 상호 일치 검증 (있으면)
-            new_account = normalize_account_ref(new.account_id, new.account_name)
-            new_counter = normalize_account_ref(new.counter_account_id, new.counter_account_name)
-            ex_account = normalize_account_ref(getattr(existing, "account_id", None), None)
-            ex_counter = normalize_account_ref(getattr(existing, "counter_account_id", None), None)
+            # 신규 항목: 제공된 주 계좌를 우선 사용 (from 우선, 없으면 to)
+            new_from = normalize_account_ref(getattr(new, "from_account_id", None), getattr(new, "from_account_name", None))
+            new_to = normalize_account_ref(getattr(new, "to_account_id", None), getattr(new, "to_account_name", None))
+            if new_from:
+                new_account = new_from
+                new_counter = new_to
+            else:
+                new_account = new_to
+                new_counter = new_from
+
+            # 기존 항목: ORM/hybrid 또는 더미 객체 모두 지원 (from/to가 우선, 없으면 legacy account/counter)
+            ex_from = normalize_account_ref(
+                getattr(existing, "from_account_id", None) if hasattr(existing, "from_account_id") else getattr(existing, "account_id", None),
+                None,
+            ) or normalize_account_ref(getattr(existing, "account_id", None), None)
+            ex_to = normalize_account_ref(
+                getattr(existing, "to_account_id", None) if hasattr(existing, "to_account_id") else getattr(existing, "counter_account_id", None),
+                None,
+            ) or normalize_account_ref(getattr(existing, "counter_account_id", None), None)
+
+            if ex_from:
+                ex_account = ex_from
+                ex_counter = ex_to
+            else:
+                ex_account = ex_to
+                ex_counter = ex_from
 
             # 강한 매칭: 한쪽의 counter == 상대의 account
             strong = (new_counter and new_counter == ex_account) or (ex_counter and ex_counter == new_account)
@@ -245,6 +276,12 @@ class TransactionBulkService:
             if not new_counter and not ex_counter:
                 # 서로 다른 계좌인지 확인 (같은 계좌 간 이체는 불가)
                 if new_account and ex_account and new_account != ex_account:
+                    try:
+                        print(
+                            f"[db-transfer-cmp] new_acc={new_account}, new_ctr={new_counter}, ex_acc={ex_account}, ex_ctr={ex_counter}, strong={strong}, time_ok={time_ok}, new_amt={new.amount}, ex_amt={existing.amount}"
+                        )
+                    except Exception:
+                        pass
                     return True
 
             return False
@@ -257,12 +294,36 @@ class TransactionBulkService:
             )
             
             if is_transfer_like and not auto_match:
+                try:
+                    print(
+                        f"[db-transfer-scan] item(date={item.occurred_at}, time={item.occurred_time}, amt={item.amount}, type={item.type.value}, flow={getattr(item,'transfer_flow',None)}, cur={item.currency})"
+                    )
+                except Exception:
+                    pass
                 candidates = _query_candidates(item).all()
+                try:
+                    print(f"[db-transfer-scan] candidates={len(candidates)} for date={item.occurred_at}")
+                except Exception:
+                    pass
                 found = next((ex for ex in candidates if _is_match(item, ex)), None)
                 if found:
+                    try:
+                        # 최소 디버그 로그: 테스트에서 매칭 관찰용
+                        print(
+                            f"[db-transfer-match] new(date={item.occurred_at}, time={item.occurred_time}, amt={item.amount}, acc={getattr(item, 'from_account_id', None) or getattr(item, 'to_account_id', None)}) -> existing(id={getattr(found, 'id', None)}, amt={getattr(found, 'amount', None)})"
+                        )
+                    except Exception:
+                        pass
                     match_count += 1
                     # 향후: found에 counter 정보 보강 및 balance 반영 로직 추가 가능
                     continue  # 생성 스킵
+            else:
+                try:
+                    print(
+                        f"[db-transfer-skip] item considered non-transfer-like or auto-matched: type={getattr(item,'type',None)}, flow={getattr(item,'transfer_flow',None)}, auto={auto_match}"
+                    )
+                except Exception:
+                    pass
 
             filtered.append((item, auto_match))
 
@@ -337,10 +398,13 @@ class TransactionBulkService:
         # 후보 account name 수집 후 일괄 조회 (이미 id가 있으면 생략)
         name_set: Set[str] = set()
         for item, _ in items_to_create:
-            if getattr(item, "account_id", None):
+            primary_id = getattr(item, "from_account_id", None) or getattr(item, "to_account_id", None)
+            if primary_id:
                 continue
-            if getattr(item, "account_name", None):
-                name_set.add(item.account_name)
+            if getattr(item, "from_account_name", None):
+                name_set.add(item.from_account_name)
+            elif getattr(item, "to_account_name", None):
+                name_set.add(item.to_account_name)
         name_to_id: Dict[str, int] = {}
         if name_set:
             accounts = (
@@ -363,9 +427,11 @@ class TransactionBulkService:
                 continue
 
             # 계정 id 해석
-            account_id: Optional[int] = getattr(item, "account_id", None)
-            if account_id is None and getattr(item, "account_name", None):
-                account_id = name_to_id.get(item.account_name)
+            account_id: Optional[int] = getattr(item, "from_account_id", None) or getattr(item, "to_account_id", None)
+            if account_id is None and getattr(item, "from_account_name", None):
+                account_id = name_to_id.get(item.from_account_name)
+            if account_id is None and getattr(item, "to_account_name", None):
+                account_id = name_to_id.get(item.to_account_name)
             if account_id is None:
                 # 계정 id 확인 불가 시 스킵 (생성 단계에서 처리)
                 filtered.append((item, auto_match))
@@ -376,7 +442,12 @@ class TransactionBulkService:
                 .filter(models.Transaction.user_id == user_id)
                 .filter(models.Transaction.type == item.type)
                 .filter(models.Transaction.occurred_at == item.occurred_at)
-                .filter(models.Transaction.account_id == account_id)
+                .filter(
+                    or_(
+                        models.Transaction.from_account_id == account_id,
+                        models.Transaction.to_account_id == account_id,
+                    )
+                )
                 .filter(models.Transaction.currency == (item.currency or "").upper())
             )
             if getattr(item, "occurred_time", None) is not None:
@@ -435,17 +506,22 @@ class TransactionBulkService:
             
             if not self._is_effectively_neutral_txn(tx):
                 if (
-                    tx.type == models.TxnType.TRANSFER 
-                    and tx.is_auto_transfer_match 
-                    and tx.counter_account_id
+                    tx.type == models.TxnType.TRANSFER
+                    and tx.is_auto_transfer_match
+                    and (tx.to_account_id or tx.from_account_id)
                 ):
-                    self._revert_single_transfer_effect(
-                        tx.account_id, 
-                        tx.counter_account_id, 
-                        float(tx.amount)
+                    self.balance_service.revert_signed_transfer(
+                        tx.from_account_id,
+                        tx.to_account_id,
+                        float(tx.amount),
                     )
                 else:
-                    self._apply_balance(tx.account_id, -float(tx.amount))
+                    primary_account = tx.from_account_id or tx.to_account_id
+                    if primary_account is not None:
+                        self.balance_service.apply_signed_delta(primary_account, -float(tx.amount))
+                    else:
+                        # TODO: directional metadata missing – manual reconciliation required
+                        pass
             
             self.db.delete(tx)
         
@@ -539,16 +615,14 @@ class TransactionBulkService:
         return _is_effectively_neutral_txn(tx)
     
     def _revert_single_transfer_effect(
-        self, 
-        account_id: int, 
-        counter_account_id: int, 
-        amount: float
+        self,
+        account_id: int,
+        counter_account_id: int,
+        amount: float,
     ) -> None:
-        """TRANSFER 효과 되돌림 (routers.py 함수 호출)"""
-        from app.routers import _revert_single_transfer_effect
-        _revert_single_transfer_effect(self.db, account_id, counter_account_id, amount)
-    
+        """TRANSFER 효과 되돌림 (신규 directional 모델 대응)"""
+        self.balance_service.revert_signed_transfer(account_id, counter_account_id, amount)
+
     def _apply_balance(self, account_id: int, amount: float) -> None:
-        """잔액 적용 (routers.py 함수 호출)"""
-        from app.routers import _apply_balance
-        _apply_balance(self.db, account_id, amount)
+        """잔액 적용 (legacy delta 호환)"""
+        self.balance_service.apply_signed_delta(account_id, amount)

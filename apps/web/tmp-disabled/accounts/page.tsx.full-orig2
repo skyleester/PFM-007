@@ -1,0 +1,1548 @@
+"use client";
+
+import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+
+import { PageHeader } from "@/components/layout/PageHeader";
+import { SectionCard } from "@/components/layout/SectionCard";
+import { StickyAside } from "@/components/layout/StickyAside";
+import { usePersistentState } from "@/lib/hooks/usePersistentState";
+
+import { apiDelete, apiGet, apiPatch, apiPost } from "@/lib/api";
+import { MemberSelector } from "@/components/MemberSelector";
+
+const USER_ID = 1;
+
+type ResetKind = "transactions" | "accounts" | "categories";
+type ResetResponse = { removed: number; details?: Record<string, number> | null };
+const RESET_LABELS: Record<string, string> = {
+  transactions: "트랜잭션",
+  accounts: "계좌",
+  categories: "카테고리",
+};
+
+const RESET_CONFIRM: Record<ResetKind, string> = {
+  transactions: "해당 사용자의 모든 트랜잭션을 삭제하고 계좌 잔액을 초기화합니다. 계속할까요?",
+  accounts: "모든 계좌와 관련 트랜잭션, 예산, 정기 규칙이 삭제됩니다. 계속할까요?",
+  categories: "모든 카테고리와 그룹이 삭제되며 트랜잭션도 함께 초기화됩니다. 계속할까요?",
+};
+
+const DETAIL_LABELS: Record<string, string> = {
+  transactions_removed: "트랜잭션",
+  accounts_removed: "계좌",
+  recurring_rules_removed: "정기 규칙",
+  budgets_removed: "예산",
+  categories_removed: "카테고리",
+  groups_removed: "카테고리 그룹",
+  recurring_rules_detached: "정기 규칙 연결 해제",
+};
+
+const ACCOUNT_TYPES = [
+  "DEPOSIT",
+  "CHECK_CARD",
+  "CREDIT_CARD",
+  "SAVINGS",
+  "LOAN",
+  "CREDIT_LINE",
+  "RETIREMENT",
+  "FUND",
+  "STOCK",
+  "CRYPTO",
+  "OTHER",
+] as const;
+
+type AccountType = (typeof ACCOUNT_TYPES)[number];
+
+const ACCOUNT_TYPE_LABELS: Partial<Record<AccountType, string>> = {
+  DEPOSIT: "예금",
+  CHECK_CARD: "체크카드",
+  CREDIT_CARD: "신용카드",
+};
+
+const FEATURED_ACCOUNT_TYPES: AccountType[] = ["DEPOSIT", "CHECK_CARD", "CREDIT_CARD"];
+
+"use client";
+
+// Minimal bisect stub: import a single local module
+import { PageHeader } from "@/components/layout/PageHeader";
+
+export default function AccountsPageBisect() {
+  return (
+    <div className="p-6 space-y-4">
+      <h1 className="text-xl font-semibold">Accounts – Bisect Mode</h1>
+      <p className="text-sm text-gray-600">Importing: PageHeader (local)</p>
+    </div>
+  );
+}
+        resetForm();
+        return;
+      }
+      setFormDrafts((prev) => {
+        const base = buildFormFromAccount(match);
+        const current = prev.edits[activeId];
+        if (current && formStatesEqual(current, base)) {
+          return prev;
+        }
+        return {
+          create: prev.create,
+          edits: { ...prev.edits, [activeId]: base },
+        };
+      });
+    },
+    [resetForm, setFormDrafts]
+  );
+
+  const loadAccounts = useCallback(async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const users = (memberIds && memberIds.length > 0) ? memberIds : [USER_ID];
+      const data = await apiGet<AccountRecord[]>("/api/accounts", { user_id: users });
+      setAccounts(data);
+      syncSelectionFromData(data);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setLoading(false);
+    }
+  }, [memberIds, syncSelectionFromData]);
+
+  const loadTransactions = useCallback(async (accountId: number) => {
+    setTransactionsLoading(true);
+    setTransactionsError(null);
+    try {
+      const base = process.env.NEXT_PUBLIC_BACKEND_URL || "http://127.0.0.1:8000";
+      const url = new URL("/api/transactions", base);
+      const users = (memberIds && memberIds.length > 0) ? memberIds : [USER_ID];
+      for (const id of users) url.searchParams.append("user_id", String(id));
+      url.searchParams.set("account_id", String(accountId));
+      url.searchParams.set("page_size", "500");
+      const res = await fetch(url.toString(), { cache: 'no-store' });
+      if (!res.ok) throw new Error(await res.text());
+      const data = (await res.json()) as TransactionRecord[];
+      const sorted = [...data].sort((a, b) => {
+        if (a.occurred_at === b.occurred_at) {
+          const timeA = a.occurred_time ?? "";
+          const timeB = b.occurred_time ?? "";
+          if (timeA === timeB) {
+            return b.id - a.id;
+          }
+          return timeA < timeB ? 1 : -1;
+        }
+        return a.occurred_at < b.occurred_at ? 1 : -1;
+      });
+      setTransactions(sorted);
+      const key = String(accountId);
+      const txnIds = new Set(sorted.map((tx) => tx.id));
+      setSelectionMap((prev) => {
+        const current = prev[key] ?? [];
+        const filtered = current.filter((id) => txnIds.has(id));
+        if (arraysShallowEqual(current, filtered)) {
+          if (current.length === 0 && !(key in prev)) {
+            return { ...prev, [key]: [] };
+          }
+          return prev;
+        }
+        return { ...prev, [key]: filtered };
+      });
+    } catch (err) {
+      setTransactionsError(err instanceof Error ? err.message : String(err));
+      setTransactions([]);
+      const key = String(accountId);
+      setSelectionMap((prev) => {
+        if (prev[key]?.length === 0) {
+          return prev;
+        }
+        return { ...prev, [key]: [] };
+      });
+    } finally {
+      setTransactionsLoading(false);
+    }
+  }, [memberIds, setSelectionMap]);
+
+  useEffect(() => {
+    selectedIdRef.current = selectedId;
+  }, [selectedId]);
+
+  useEffect(() => {
+    loadAccounts();
+  }, [loadAccounts]);
+
+  useEffect(() => {
+    if (selectedId == null) {
+      setTransactions([]);
+      setTransactionsError(null);
+      setMoveBusy(false);
+      return;
+    }
+    void loadTransactions(selectedId);
+  }, [loadTransactions, selectedId]);
+
+  // Load credit-card summary when a credit card account is selected (use the account owner's user_id)
+  useEffect(() => {
+    let cancelled = false;
+    async function loadSummary(account: AccountRecord) {
+      try {
+        const base = process.env.NEXT_PUBLIC_BACKEND_URL || "http://127.0.0.1:8000";
+        const url = new URL(`/api/accounts/${account.id}/credit-card-summary`, base);
+        url.searchParams.set("user_id", String(account.user_id));
+        const res = await fetch(url.toString(), { cache: "no-store" });
+        if (!res.ok) throw new Error(await res.text());
+        const data = (await res.json()) as CreditCardAccountSummary;
+        if (!cancelled) setCcSummary(data);
+      } catch (_err) {
+        if (!cancelled) setCcSummary(null);
+      }
+    }
+    const acc = accounts.find((a) => a.id === selectedId) || null;
+    if (acc?.type === "CREDIT_CARD" && acc.id) {
+      void loadSummary(acc);
+    } else {
+      setCcSummary(null);
+    }
+    return () => {
+      cancelled = true;
+    };
+  }, [accounts, selectedId]);
+
+  // Load credit-card statements list for the selected card (use the account owner's user_id)
+  useEffect(() => {
+    let cancelled = false;
+    async function loadStatements(account: AccountRecord) {
+      try {
+        const base = process.env.NEXT_PUBLIC_BACKEND_URL || "http://127.0.0.1:8000";
+        const url = new URL(`/api/accounts/${account.id}/credit-card-statements`, base);
+        url.searchParams.set("user_id", String(account.user_id));
+        url.searchParams.set("page_size", "100");
+        const res = await fetch(url.toString(), { cache: "no-store" });
+        if (!res.ok) throw new Error(await res.text());
+        const list = (await res.json()) as CreditCardStatement[];
+        if (!cancelled) setCcStatements(list);
+      } catch (_err) {
+        if (!cancelled) setCcStatements([]);
+      }
+    }
+    const acc = accounts.find((a) => a.id === selectedId) || null;
+    if (acc?.type === "CREDIT_CARD" && acc.id) {
+      void loadStatements(acc);
+    } else {
+      setCcStatements(null);
+    }
+    return () => {
+      cancelled = true;
+    };
+  }, [accounts, selectedId]);
+
+  const statementMap = useMemo(() => {
+    const map = new Map<number, CreditCardStatement>();
+    if (ccStatements) {
+      for (const s of ccStatements) map.set(s.id, s);
+    }
+    if (ccSummary?.active_statement) map.set(ccSummary.active_statement.id, ccSummary.active_statement);
+    if (ccSummary?.last_paid_statement) map.set(ccSummary.last_paid_statement.id, ccSummary.last_paid_statement);
+    return map;
+  }, [ccStatements, ccSummary]);
+
+  const handleSettle = useCallback(async (statementId: number) => {
+    setSettleBusy(true);
+    setMessage(null);
+    setError(null);
+    try {
+      const base = process.env.NEXT_PUBLIC_BACKEND_URL || "http://127.0.0.1:8000";
+      const url = new URL(`/api/credit-card-statements/${statementId}/settle`, base);
+      const ownerUserId = (() => {
+        const acc = accounts.find((a) => a.id === selectedId) || null;
+        return acc ? acc.user_id : USER_ID;
+      })();
+      const res = await fetch(url.toString(), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ user_id: ownerUserId }),
+      });
+      if (!res.ok) throw new Error(await res.text());
+      // Refresh data
+      await loadAccounts();
+      if (selectedId) await loadTransactions(selectedId);
+      // Reload cc summary/statements
+      const acc = accounts.find((a) => a.id === selectedId) || null;
+      if (acc?.id) {
+        // fire-and-forget, effects will refetch based on deps; but ensure immediate UX
+        setStatementDetailId(null);
+      }
+      setMessage("정산이 완료되었습니다.");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setSettleBusy(false);
+    }
+  }, [accounts, loadAccounts, loadTransactions, selectedId, setError, setMessage]);
+
+  useEffect(() => {
+    if (selectedId == null) return;
+    if (!moveTargetId) return;
+    if (!accounts.some((account) => account.id === moveTargetId)) {
+      setMoveTargetId("");
+    }
+  }, [accounts, moveTargetId, selectedId, setMoveTargetId]);
+
+  const accountNameMap = useMemo(() => {
+    const map = new Map<number, AccountRecord>();
+    for (const account of accounts) {
+      map.set(account.id, account);
+    }
+    return map;
+  }, [accounts]);
+
+  const depositAccounts = useMemo(() => {
+    return accounts.filter((acc) => acc.type === "DEPOSIT");
+  }, [accounts]);
+
+  const linkedDepositForForm = useMemo(() => {
+    if (form.type !== "CHECK_CARD" && form.type !== "CREDIT_CARD") return null;
+    const targetId = form.linked_account_id === "" ? null : Number(form.linked_account_id);
+    if (!targetId) return null;
+    return depositAccounts.find((acc) => acc.id === targetId) ?? null;
+  }, [depositAccounts, form.linked_account_id, form.type]);
+
+  const isCheckCardForm = form.type === "CHECK_CARD";
+  const isCreditCardForm = form.type === "CREDIT_CARD";
+  const isCardForm = isCheckCardForm || isCreditCardForm;
+  const balanceLocked = isCardForm;
+  const currencyLocked = isCheckCardForm && !!linkedDepositForForm?.currency;
+
+  useEffect(() => {
+    if (!isCardForm) return;
+    setForm((prev) => {
+      if (!isCardForm) {
+        return prev;
+      }
+      const targetId = prev.linked_account_id === "" ? null : Number(prev.linked_account_id);
+      const linked = targetId ? depositAccounts.find((acc) => acc.id === targetId) ?? null : null;
+      const updates: Partial<FormState> = {};
+      let changed = false;
+      if (prev.current_balance !== "0") {
+        updates.current_balance = "0";
+        changed = true;
+      }
+      if (prev.initial_balance !== "0") {
+        updates.initial_balance = "0";
+        changed = true;
+      }
+      if (isCheckCardForm && linked?.currency && prev.currency !== linked.currency) {
+        updates.currency = linked.currency;
+        changed = true;
+      }
+      return changed ? { ...prev, ...updates } : prev;
+    });
+  }, [depositAccounts, form.linked_account_id, form.type, isCardForm, isCheckCardForm, setForm]);
+
+  const moveCandidates = useMemo(() => {
+    if (!selectedId) return [] as AccountRecord[];
+    return accounts.filter((acc) => acc.id !== selectedId);
+  }, [accounts, selectedId]);
+
+  const selectedAccount = useMemo(() => {
+    if (!selectedId) return null;
+    return accounts.find((acc) => acc.id === selectedId) ?? null;
+  }, [accounts, selectedId]);
+
+  const balanceAnalytics = useMemo(() => {
+    const currentBalanceValue = parseNumeric(form.current_balance);
+    if (!selectedId) {
+      return {
+        currentBalanceValue,
+        initialBalanceValue: parseNumeric(form.initial_balance),
+        netActivity: 0,
+        runningBalanceMap: new Map<number, number>(),
+      } as const;
+    }
+
+    let running = currentBalanceValue;
+    let netActivity = 0;
+    const runningBalanceMap = new Map<number, number>();
+    for (const tx of transactions) {
+      runningBalanceMap.set(tx.id, running);
+      if (affectsBalance(tx)) {
+        running -= tx.amount;
+        netActivity += tx.amount;
+      }
+    }
+    const initialBalanceValue = running;
+    return { currentBalanceValue, initialBalanceValue, netActivity, runningBalanceMap } as const;
+  }, [form.current_balance, form.initial_balance, selectedId, transactions]);
+
+  const { currentBalanceValue, initialBalanceValue, netActivity, runningBalanceMap } = balanceAnalytics;
+
+  useEffect(() => {
+    if (!selectedId) {
+      setForm((prev) => {
+        if (prev.initial_balance === prev.current_balance) return prev;
+        return { ...prev, initial_balance: prev.current_balance };
+      });
+      return;
+    }
+    const derivedInitial = toBalanceInput(initialBalanceValue);
+    setForm((prev) => {
+      if (prev.initial_balance === derivedInitial) return prev;
+      return { ...prev, initial_balance: derivedInitial };
+    });
+  }, [initialBalanceValue, selectedId, setForm]);
+
+  const displayTransactions = useMemo(() => {
+    if (transactions.length === 0) return [] as TransactionRecord[];
+    const sorted = [...transactions];
+    sorted.sort((a, b) => {
+      let compare = 0;
+      if (transactionSort.key === "occurred_at") {
+        if (a.occurred_at === b.occurred_at) {
+          const timeA = a.occurred_time ?? "";
+          const timeB = b.occurred_time ?? "";
+          if (timeA === timeB) {
+            compare = a.id - b.id;
+          } else {
+            compare = timeA < timeB ? -1 : 1;
+          }
+        } else {
+          compare = a.occurred_at < b.occurred_at ? -1 : 1;
+        }
+      } else if (transactionSort.key === "amount") {
+        if (a.amount === b.amount) {
+          compare = a.id - b.id;
+        } else {
+          compare = a.amount < b.amount ? -1 : 1;
+        }
+      }
+      return transactionSort.order === "asc" ? compare : -compare;
+    });
+    return sorted;
+  }, [transactionSort, transactions]);
+
+  const selectedTransactionCount = selectedTransactionIds.size;
+
+  const selectedTransactionsAmount = useMemo(() => {
+    if (selectedTransactionIds.size === 0) return 0;
+    return displayTransactions.reduce((sum, tx) => (selectedTransactionIds.has(tx.id) ? sum + tx.amount : sum), 0);
+  }, [displayTransactions, selectedTransactionIds]);
+
+  const isAllTransactionsSelected = displayTransactions.length > 0 && selectedTransactionIds.size === displayTransactions.length;
+  const moveDisabled = !selectedId || selectedTransactionCount === 0 || !moveTargetId || moveBusy || transactionsLoading;
+
+  const handleTransactionSort = useCallback(
+    (key: TransactionSortKey) => {
+      setTransactionSort((prev) => {
+        if (prev.key === key) {
+          return { key, order: prev.order === "desc" ? "asc" : "desc" };
+        }
+        return { key, order: key === "occurred_at" ? "desc" : "asc" };
+      });
+    },
+    [setTransactionSort]
+  );
+
+  const handleCurrentBalanceInput = useCallback(
+    (value: string) => {
+      setForm((prev) => {
+        const parsed = Number(value);
+        if (!Number.isFinite(parsed)) {
+          return { ...prev, current_balance: value };
+        }
+        const derivedInitial = parsed - netActivity;
+        return {
+          ...prev,
+          current_balance: value,
+          initial_balance: toBalanceInput(derivedInitial),
+        };
+      });
+    },
+    [netActivity, setForm]
+  );
+
+  const handleInitialBalanceInput = useCallback(
+    (value: string) => {
+      setForm((prev) => {
+        const parsed = Number(value);
+        if (!Number.isFinite(parsed)) {
+          return { ...prev, initial_balance: value };
+        }
+        const derivedCurrent = parsed + netActivity;
+        return {
+          ...prev,
+          initial_balance: value,
+          current_balance: toBalanceInput(derivedCurrent),
+        };
+      });
+    },
+    [netActivity, setForm]
+  );
+
+  const toggleTransactionSelection = useCallback(
+    (transactionId: number) => {
+      updateSelection((prev) => {
+        const next = new Set(prev);
+        if (next.has(transactionId)) {
+          next.delete(transactionId);
+        } else {
+          next.add(transactionId);
+        }
+        return Array.from(next).sort((a, b) => a - b);
+      });
+    },
+    [updateSelection]
+  );
+
+  const toggleAllTransactions = useCallback(
+    (checked: boolean) => {
+      if (checked) {
+        updateSelection(() => displayTransactions.map((tx) => tx.id));
+      } else {
+        updateSelection(() => []);
+      }
+    },
+    [displayTransactions, updateSelection]
+  );
+
+  const handleMoveTransactions = useCallback(async () => {
+    if (!selectedId || selectedTransactionIds.size === 0 || !moveTargetId) {
+      return;
+    }
+    if (Number(moveTargetId) === selectedId) {
+      setError("같은 계좌로 이동할 수 없습니다.");
+      return;
+    }
+    if (!window.confirm("선택된 거래를 다른 계좌로 이동할까요?")) {
+      return;
+    }
+    setMoveBusy(true);
+    setMessage(null);
+    setError(null);
+    try {
+      const result = await apiPost<TransactionsBulkMoveResult>("/api/transactions/bulk-move-account", {
+        user_id: USER_ID,
+        transaction_ids: Array.from(selectedTransactionIds),
+        target_account_id: Number(moveTargetId),
+      });
+      const parts: string[] = [];
+      if (result.updated) {
+        parts.push(`이동 ${result.updated.toLocaleString()}건`);
+      }
+      if (result.skipped.length > 0) {
+        parts.push(`건너뜀 ${result.skipped.length.toLocaleString()}건`);
+      }
+      if (result.missing.length > 0) {
+        parts.push(`누락 ${result.missing.length.toLocaleString()}건`);
+      }
+      const summary = parts.length > 0 ? parts.join(", ") : "처리된 항목 없음";
+      setMessage(`거래 계정 이동 완료: ${summary}.`);
+      setMoveTargetId("");
+      updateSelection(() => []);
+      await loadAccounts();
+      await loadTransactions(selectedId);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setMoveBusy(false);
+    }
+  }, [loadAccounts, loadTransactions, moveTargetId, selectedId, selectedTransactionIds, setMoveTargetId, updateSelection]);
+
+  // 총 잔액 계산 (활성/전체)
+  const { totalActive, totalAll } = (() => {
+    let active = 0;
+    let all = 0;
+    for (const a of accounts) {
+      const val = typeof a.balance === "number" ? a.balance : Number(a.balance);
+      const num = Number.isFinite(val) ? Number(val) : 0;
+      const isLinkedCheckCard = a.type === "CHECK_CARD" && a.linked_account_id != null;
+      if (isLinkedCheckCard) {
+        continue;
+      }
+      all += num;
+      if (!a.is_archived) active += num;
+    }
+    return { totalActive: active, totalAll: all };
+  })();
+
+  const handleSelectRow = useCallback(
+    (account: AccountRecord) => {
+      if (selectedIdRef.current === account.id) {
+        resetForm();
+        setMessage(null);
+        setError(null);
+        return;
+      }
+      selectedIdRef.current = account.id;
+      setSelectedId(account.id);
+      setFormDrafts((prev) => {
+        const base = buildFormFromAccount(account);
+        const existing = prev.edits[account.id];
+        if (existing && formStatesEqual(existing, base)) {
+          return prev;
+        }
+        return {
+          create: prev.create,
+          edits: { ...prev.edits, [account.id]: base },
+        };
+      });
+      setMergeTargetId("");
+      setTransactions([]);
+      const key = String(account.id);
+      setSelectionMap((prev) => (key in prev ? prev : { ...prev, [key]: [] }));
+      setMoveTargetMap((prev) => (key in prev ? prev : { ...prev, [key]: "" }));
+      setTransactionsError(null);
+      setMessage(null);
+      setError(null);
+    },
+    [resetForm, setFormDrafts, setSelectionMap, setMoveTargetMap, setSelectedId]
+  );
+
+  const handleSubmit = useCallback(
+    async (event: FormEvent<HTMLFormElement>) => {
+      event.preventDefault();
+      setMessage(null);
+      setError(null);
+
+      const trimmedName = form.name.trim();
+      if (!trimmedName) {
+        setError("계좌 이름을 입력하세요.");
+        return;
+      }
+
+      const currentBalanceValueInput = Number(form.current_balance);
+      if (!Number.isFinite(currentBalanceValueInput)) {
+        setError("유효한 현재 잔액을 입력하세요.");
+        return;
+      }
+
+      const currency = form.currency.trim();
+      if (currency && currency.length !== 3) {
+        setError("통화 코드는 3자리여야 합니다.");
+        return;
+      }
+
+      const isCard = form.type === "CHECK_CARD" || form.type === "CREDIT_CARD";
+      const linkedAccountId = isCard ? (form.linked_account_id === "" ? null : Number(form.linked_account_id)) : null;
+
+      if (isCard && !linkedAccountId) {
+        setError(form.type === "CHECK_CARD" ? "체크카드에 연결할 입출금 계좌를 선택하세요." : "신용카드 대금이 출금될 입출금 계좌를 선택하세요.");
+        return;
+      }
+
+      const linkedAccount = isCard && linkedAccountId
+        ? depositAccounts.find((acc) => acc.id === linkedAccountId) ?? null
+        : null;
+      const normalizedCurrency = currency ? currency.toUpperCase() : null;
+      if (
+        form.type === "CHECK_CARD"
+        && linkedAccount
+        && linkedAccount.currency
+        && normalizedCurrency
+        && normalizedCurrency !== linkedAccount.currency
+      ) {
+        setError("체크카드 통화는 연동 통장과 동일해야 합니다.");
+        return;
+      }
+
+      const effectiveCurrency = form.type === "CHECK_CARD"
+        ? (linkedAccount?.currency ?? normalizedCurrency)
+        : normalizedCurrency;
+
+      if (form.type === "CREDIT_CARD") {
+        const cutoff = form.billing_cutoff_day === "" ? null : Number(form.billing_cutoff_day);
+        const payment = form.payment_day === "" ? null : Number(form.payment_day);
+        if (!cutoff || cutoff < 1 || cutoff > 31) {
+          setError("신용카드 청구 마감일을 1–31 사이로 입력하세요.");
+          return;
+        }
+        if (!payment || payment < 1 || payment > 31) {
+          setError("신용카드 결제일을 1–31 사이로 입력하세요.");
+          return;
+        }
+      }
+
+      const basePayload = {
+        name: trimmedName,
+        type: form.type,
+        currency: effectiveCurrency ? effectiveCurrency.toUpperCase() : null,
+        balance: isCard ? 0 : currentBalanceValueInput,
+        linked_account_id: linkedAccountId,
+        billing_cutoff_day: form.type === "CREDIT_CARD" ? Number(form.billing_cutoff_day) : null,
+        payment_day: form.type === "CREDIT_CARD" ? Number(form.payment_day) : null,
+      };
+
+      setPendingAction("form");
+      try {
+        if (selectedIdRef.current) {
+          await apiPatch<AccountRecord>(`/api/accounts/${selectedIdRef.current}`, {
+            ...basePayload,
+            is_archived: form.is_archived,
+          });
+          setFormDrafts((prev) => {
+            const targetId = selectedIdRef.current;
+            if (!targetId || !(targetId in prev.edits)) {
+              return prev;
+            }
+            const nextEdits = { ...prev.edits };
+            delete nextEdits[targetId];
+            return { create: prev.create, edits: nextEdits };
+          });
+          await loadAccounts();
+          setMessage("계좌 정보를 업데이트했습니다.");
+        } else {
+          await apiPost<AccountRecord>("/api/accounts", {
+            user_id: form.user_id,
+            ...basePayload,
+          });
+          await loadAccounts();
+          resetForm();
+          setMessage("새 계좌를 만들었습니다.");
+        }
+      } catch (err) {
+        setError(err instanceof Error ? err.message : String(err));
+      } finally {
+        setPendingAction(null);
+      }
+    },
+    [depositAccounts, form, loadAccounts, resetForm, setFormDrafts]
+  );
+
+  const handleDelete = useCallback(
+    async () => {
+      if (!selectedIdRef.current) return;
+      if (!window.confirm("선택한 계좌를 삭제할까요? 이 작업은 되돌릴 수 없습니다.")) {
+        return;
+      }
+      setPendingAction("delete");
+      setMessage(null);
+      setError(null);
+      try {
+        await apiDelete(`/api/accounts/${selectedIdRef.current}`);
+        resetForm();
+        await loadAccounts();
+        setMessage("계좌를 삭제했습니다.");
+      } catch (err) {
+        setError(err instanceof Error ? err.message : String(err));
+      } finally {
+        setPendingAction(null);
+      }
+    },
+    [loadAccounts, resetForm]
+  );
+
+  const handleReset = useCallback(
+    async (kind: ResetKind) => {
+      const actionKey = `reset-${kind}` as const;
+      if (!window.confirm(RESET_CONFIRM[kind])) {
+        return;
+      }
+      setPendingAction(actionKey);
+      setMessage(null);
+      setError(null);
+      try {
+        const result = await apiPost<ResetResponse>(`/api/maintenance/reset-${kind}`, { user_id: USER_ID });
+        await loadAccounts();
+        if (kind === "accounts") {
+          resetForm();
+        }
+        const removedCount = result?.removed ?? 0;
+        const detailSummary = summarizeDetails(result?.details ?? undefined);
+        const summary = `${RESET_LABELS[kind]} 초기화 완료: ${removedCount.toLocaleString()}건${detailSummary ? ` (${detailSummary})` : ""}`;
+        setMessage(summary);
+      } catch (err) {
+        setError(err instanceof Error ? err.message : String(err));
+      } finally {
+        setPendingAction(null);
+      }
+    },
+    [loadAccounts, resetForm]
+  );
+
+  const handleMerge = useCallback(async () => {
+    if (!selectedIdRef.current || !mergeTargetId) return;
+    if (!window.confirm("선택한 계좌의 거래와 잔액을 대상 계좌로 통합할까요?")) {
+      return;
+    }
+    setMergeBusy(true);
+    setMessage(null);
+    setError(null);
+    try {
+      const result = await apiPost<AccountMergeResult>(`/api/accounts/${selectedIdRef.current}/merge`, {
+        target_account_id: Number(mergeTargetId),
+        archive_source: true,
+        combine_balances: true,
+      });
+      selectedIdRef.current = result.target.id;
+      setSelectedId(result.target.id);
+      setMergeTargetId("");
+      await loadAccounts();
+      const parts = [
+        result.transactions_moved ? `거래 ${result.transactions_moved.toLocaleString()}건` : null,
+        result.counter_links_updated ? `상대 계좌 링크 ${result.counter_links_updated.toLocaleString()}건` : null,
+        result.recurring_updated || result.recurring_counter_updated
+          ? `정기 규칙 ${(
+              result.recurring_updated + result.recurring_counter_updated
+            ).toLocaleString()}건`
+          : null,
+        result.budgets_updated ? `예산 ${result.budgets_updated.toLocaleString()}건` : null,
+      ].filter(Boolean);
+      const summary = parts.length > 0 ? parts.join(", ") : "관련 항목 없음";
+      setMessage(`계좌를 통합했습니다. ${summary}.`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setMergeBusy(false);
+    }
+  }, [mergeTargetId, loadAccounts, setSelectedId]);
+
+  if (!selectedHydrated || !formDraftsHydrated || !selectionHydrated || !moveTargetHydrated || !sortHydrated) {
+    return (
+      <div className="space-y-8">
+        <PageHeader title="Accounts" />
+        <SectionCard tone="muted">
+          <p className="text-sm text-gray-600">계좌 페이지 상태를 복원하는 중…</p>
+        </SectionCard>
+      </div>
+    );
+  }
+
+  const headerActions = (
+    <div className="flex flex-col items-start gap-2 text-xs text-gray-500 sm:flex-row sm:items-center sm:gap-3 sm:text-sm">
+      <MemberSelector value={memberIds} onChange={setMemberIds} />
+      <span>총 {accounts.length.toLocaleString()}개</span>
+      <span className="hidden sm:inline">|</span>
+      <span>총 잔액(활성): <strong className="tabular-nums">{formatBalance(totalActive)}</strong></span>
+      <span className="hidden sm:inline">/</span>
+      <span className="text-gray-500">전체: <span className="tabular-nums">{formatBalance(totalAll)}</span></span>
+      <button
+        type="button"
+        onClick={() => loadAccounts()}
+        className="rounded border border-gray-300 bg-white px-2 py-1 text-[11px] text-gray-600 hover:bg-gray-100 sm:text-xs"
+        disabled={loading || isBusy}
+      >
+        새로고침
+      </button>
+    </div>
+  );
+
+  return (
+    <div className="space-y-8">
+      <PageHeader
+        title="Accounts"
+        subtitle="계좌를 등록하고 잔액을 추적하며 거래 내역을 관리합니다."
+        actions={headerActions}
+      />
+
+      {error && (
+        <SectionCard tone="muted">
+          <p className="text-sm text-red-700">{error}</p>
+        </SectionCard>
+      )}
+      {message && !error && (
+        <SectionCard tone="muted">
+          <p className="text-sm text-green-700">{message}</p>
+        </SectionCard>
+      )}
+
+      {/* 데이터 초기화 컨트롤은 Preferences 페이지로 이동했습니다. */}
+
+      <div className="space-y-6 lg:grid lg:grid-cols-[minmax(0,2fr)_minmax(320px,1fr)] lg:items-start lg:gap-6 lg:space-y-0">
+        <div className="space-y-6">
+          <SectionCard title="계좌 목록" description="등록된 모든 계좌를 확인하고 선택하세요.">
+            <div className="hidden overflow-x-auto sm:block">
+              <table className="min-w-full text-sm">
+              <thead className="border-b bg-gray-50 text-xs uppercase text-gray-600">
+                <tr>
+                  <th className="px-3 py-2 text-left">ID</th>
+                  <th className="px-3 py-2 text-left">Name</th>
+                  <th className="px-3 py-2 text-left">Type</th>
+                  <th className="px-3 py-2 text-left">Linked</th>
+                  <th className="px-3 py-2 text-left">Currency</th>
+                  <th className="px-3 py-2 text-right">Balance</th>
+                  <th className="px-3 py-2 text-center">Archived</th>
+                  <th className="px-3 py-2 text-right">User</th>
+                  <th className="px-3 py-2 text-left">Created</th>
+                  <th className="px-3 py-2 text-left">Updated</th>
+                </tr>
+              </thead>
+              <tbody>
+                {loading && (
+                  <tr>
+                    <td colSpan={10} className="px-3 py-6 text-center text-gray-500">불러오는 중…</td>
+                  </tr>
+                )}
+                {!loading && accounts.length === 0 && (
+                  <tr>
+                    <td colSpan={10} className="px-3 py-6 text-center text-gray-500">등록된 계좌가 없습니다.</td>
+                  </tr>
+                )}
+                {!loading && accounts.map((account) => {
+                  const isSelected = selectedId === account.id;
+                  const linkedAccount = account.linked_account_id ? accountNameMap.get(account.linked_account_id) : null;
+                  return (
+                    <tr
+                      key={account.id}
+                      className={`border-b last:border-0 hover:bg-gray-50 cursor-pointer ${isSelected ? "bg-blue-50" : ""}`}
+                      onClick={() => handleSelectRow(account)}
+                    >
+                      <td className="px-3 py-2">{account.id}</td>
+                      <td className="px-3 py-2">{account.name}</td>
+                      <td className="px-3 py-2">{account.type}</td>
+                      <td className="px-3 py-2">{linkedAccount ? `#${linkedAccount.id} ${linkedAccount.name}` : "-"}</td>
+                      <td className="px-3 py-2">{account.currency ?? "-"}</td>
+                      <td className="px-3 py-2 text-right">
+                        {(account.type === "CHECK_CARD" || account.type === "CREDIT_CARD") && linkedAccount
+                          ? `연동 (${linkedAccount.name})`
+                          : formatBalance(account.balance)}
+                      </td>
+                      <td className="px-3 py-2 text-center">{account.is_archived ? "Y" : "N"}</td>
+                      <td className="px-3 py-2 text-right">{account.user_id}</td>
+                      <td className="px-3 py-2">{formatDateTime(account.created_at)}</td>
+                      <td className="px-3 py-2">{formatDateTime(account.updated_at)}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+
+          <div className="grid gap-3 sm:hidden">
+            {accounts.map((account) => {
+              const isSelected = selectedId === account.id;
+              const linkedAccount = account.linked_account_id ? accountNameMap.get(account.linked_account_id) : null;
+              return (
+                <button
+                  key={account.id}
+                  onClick={() => handleSelectRow(account)}
+                  className={`rounded border bg-white p-3 text-left shadow-sm ${isSelected ? "border-blue-500" : "border-gray-200"}`}
+                >
+                  <div className="flex items-center justify-between">
+                    <span className="font-semibold text-gray-800">{account.name}</span>
+                    <span className="text-xs uppercase text-gray-500">{account.type}</span>
+                  </div>
+                  <div className="mt-2 text-sm">
+                    <div className="flex justify-between"><span className="text-gray-500">ID</span><span>{account.id}</span></div>
+                    <div className="flex justify-between">
+                      <span className="text-gray-500">Balance</span>
+                      <span>
+                        {(account.type === "CHECK_CARD" || account.type === "CREDIT_CARD") && linkedAccount
+                          ? `연동 (${linkedAccount.name})`
+                          : `${formatBalance(account.balance)} ${account.currency ?? ""}`.trim()}
+                      </span>
+                    </div>
+                    <div className="flex justify-between"><span className="text-gray-500">Linked</span><span>{linkedAccount ? `#${linkedAccount.id} ${linkedAccount.name}` : "-"}</span></div>
+                    <div className="flex justify-between"><span className="text-gray-500">Archived</span><span>{account.is_archived ? "Y" : "N"}</span></div>
+                    <div className="mt-1 text-xs text-gray-500">
+                      <div>Created: {formatDateTime(account.created_at)}</div>
+                      <div>Updated: {formatDateTime(account.updated_at)}</div>
+                    </div>
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+          </SectionCard>
+        </div>
+
+        <StickyAside
+          className="static lg:sticky overflow-visible border-transparent bg-transparent p-0 shadow-none"
+          offset={104}
+        >
+          <SectionCard title={selectedId ? `계좌 #${selectedId} 수정` : "새 계좌 추가"} padding="sm">
+            <form className="space-y-3" onSubmit={handleSubmit}>
+            <div className="grid gap-3">
+              <label className="flex flex-col text-sm">
+                <span className="text-xs text-gray-600">계좌 이름</span>
+                <input
+                  type="text"
+                  value={form.name}
+                  onChange={(e) => setForm((prev) => ({ ...prev, name: e.target.value }))}
+                  className="mt-1 rounded border px-2 py-1 focus:border-blue-500 focus:outline-none"
+                  placeholder="예: 급여 통장"
+                  required
+                />
+              </label>
+
+              <label className="flex flex-col text-sm">
+                <span className="text-xs text-gray-600">계좌 유형</span>
+                <select
+                  value={form.type}
+                  onChange={(e) => {
+                    const nextType = e.target.value as AccountType;
+                    const isCard = nextType === "CHECK_CARD" || nextType === "CREDIT_CARD";
+                    const fallbackLinked = isCard
+                      ? (() => {
+                          if (form.linked_account_id) return form.linked_account_id;
+                          const candidate = depositAccounts.find((acc) => acc.id !== selectedId);
+                          return candidate ? candidate.id : "";
+                        })()
+                      : "";
+                    setForm((prev) => ({
+                      ...prev,
+                      type: nextType,
+                      linked_account_id: isCard ? fallbackLinked : "",
+                      current_balance: isCard ? "0" : prev.current_balance,
+                      initial_balance: isCard ? "0" : prev.initial_balance,
+                      billing_cutoff_day: nextType === "CREDIT_CARD" ? prev.billing_cutoff_day : "",
+                      payment_day: nextType === "CREDIT_CARD" ? prev.payment_day : "",
+                    }));
+                  }}
+                  className="mt-1 rounded border px-2 py-1 focus:border-blue-500 focus:outline-none"
+                >
+                  {ACCOUNT_TYPE_OPTIONS.map((option) => (
+                    <option key={option.value} value={option.value}>{option.label}</option>
+                  ))}
+                </select>
+              </label>
+
+              {(form.type === "CHECK_CARD" || form.type === "CREDIT_CARD") && (
+                <label className="flex flex-col text-sm">
+                  <span className="text-xs text-gray-600">연동 통장</span>
+                  <select
+                    value={form.linked_account_id === "" ? "" : String(form.linked_account_id)}
+                    onChange={(e) => {
+                      const nextValue = e.target.value ? Number(e.target.value) : "";
+                      setForm((prev) => ({ ...prev, linked_account_id: nextValue }));
+                    }}
+                    className="mt-1 rounded border px-2 py-1 focus:border-blue-500 focus:outline-none"
+                  >
+                    <option value="">연동할 입출금 계좌 선택</option>
+                    {depositAccounts
+                      .filter((acc) => acc.id !== selectedId)
+                      .map((acc) => (
+                        <option key={acc.id} value={acc.id}>
+                          #{acc.id} {acc.name}
+                        </option>
+                      ))}
+                  </select>
+                  <span className="mt-1 text-[11px] text-gray-500">
+                    {form.type === "CHECK_CARD"
+                      ? "체크카드 지출이 반영될 입출금 계좌를 고르세요."
+                      : "신용카드 대금이 출금될 입출금 계좌를 고르세요."}
+                  </span>
+                </label>
+              )}
+
+              {form.type === "CREDIT_CARD" && (
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <label className="flex flex-col text-sm">
+                    <span className="text-xs text-gray-600">청구 마감일 (cutoff)</span>
+                    <input
+                      type="number"
+                      min={1}
+                      max={31}
+                      value={form.billing_cutoff_day === "" ? "" : String(form.billing_cutoff_day)}
+                      onChange={(e) => {
+                        const val = e.target.value === "" ? "" : Math.max(1, Math.min(31, Number(e.target.value)));
+                        setForm((prev) => ({ ...prev, billing_cutoff_day: val as number | "" }));
+                      }}
+                      className="mt-1 rounded border px-2 py-1 focus:border-blue-500 focus:outline-none"
+                      required={form.type === "CREDIT_CARD"}
+                    />
+                    <span className="mt-1 text-[11px] text-gray-500">1–31 사이 숫자. 월말 초과 시 마지막 날로 처리됩니다.</span>
+                  </label>
+                  <label className="flex flex-col text-sm">
+                    <span className="text-xs text-gray-600">결제일 (payment day)</span>
+                    <input
+                      type="number"
+                      min={1}
+                      max={31}
+                      value={form.payment_day === "" ? "" : String(form.payment_day)}
+                      onChange={(e) => {
+                        const val = e.target.value === "" ? "" : Math.max(1, Math.min(31, Number(e.target.value)));
+                        setForm((prev) => ({ ...prev, payment_day: val as number | "" }));
+                      }}
+                      className="mt-1 rounded border px-2 py-1 focus:border-blue-500 focus:outline-none"
+                      required={form.type === "CREDIT_CARD"}
+                    />
+                    <span className="mt-1 text-[11px] text-gray-500">1–31 사이 숫자. 월말 초과 시 마지막 날로 처리됩니다.</span>
+                  </label>
+                </div>
+              )}
+
+              <div className="grid gap-3 sm:grid-cols-2">
+                <label className="flex flex-col text-sm">
+                  <span className="text-xs text-gray-600">현재 잔액</span>
+                  <input
+                    type="number"
+                    step="0.0001"
+                    value={form.current_balance}
+                    onChange={(e) => handleCurrentBalanceInput(e.target.value)}
+                    className="mt-1 rounded border px-2 py-1 focus:border-blue-500 focus:outline-none"
+                    disabled={balanceLocked}
+                  />
+                  <span className="mt-1 text-[11px] text-gray-500">
+                    {balanceLocked
+                      ? (form.type === "CHECK_CARD"
+                          ? "체크카드 잔액은 연동 통장에서 자동으로 관리됩니다."
+                          : "신용카드 잔액은 0으로 고정되며 명세서를 통해 정산됩니다.")
+                      : "실제 계좌의 최신 잔액을 입력하세요."}
+                  </span>
+                </label>
+                <label className="flex flex-col text-sm">
+                  <span className="text-xs text-gray-600">초기 잔액</span>
+                  <input
+                    type="number"
+                    step="0.0001"
+                    value={form.initial_balance}
+                    onChange={(e) => handleInitialBalanceInput(e.target.value)}
+                    className="mt-1 rounded border px-2 py-1 focus:border-blue-500 focus:outline-none"
+                    disabled={balanceLocked}
+                  />
+                  <span className="mt-1 text-[11px] text-gray-500">
+                    {balanceLocked
+                      ? "체크카드의 기준 잔액은 항상 0으로 고정됩니다."
+                      : "가장 오래된 거래 이전의 잔액입니다."}
+                  </span>
+                </label>
+
+                <label className="flex flex-col text-sm">
+                  <span className="text-xs text-gray-600">통화 코드</span>
+                  <input
+                    type="text"
+                    maxLength={3}
+                    value={form.currency}
+                    onChange={(e) => setForm((prev) => ({ ...prev, currency: e.target.value.toUpperCase() }))}
+                    className="mt-1 rounded border px-2 py-1 uppercase focus:border-blue-500 focus:outline-none"
+                    disabled={currencyLocked}
+                    placeholder="KRW"
+                  />
+                  <span className="mt-1 text-[11px] text-gray-500">
+                    {currencyLocked
+                      ? "연동 통장의 통화와 동일하게 자동 설정됩니다."
+                      : isCheckCardForm
+                        ? "연동 통장에 통화가 지정되지 않았다면 직접 입력할 수 있습니다."
+                      : "거래에 사용할 통화 코드를 입력하세요."}
+                  </span>
+                </label>
+              </div>
+
+              <div className="flex items-center justify-between text-sm">
+                <div className="text-xs text-gray-600">
+                  사용자 ID: <span className="font-medium text-gray-800">{form.user_id}</span>
+                </div>
+                <label className="inline-flex items-center gap-2 text-xs text-gray-600">
+                  <input
+                    type="checkbox"
+                    checked={form.is_archived}
+                    onChange={(e) => setForm((prev) => ({ ...prev, is_archived: e.target.checked }))}
+                    disabled={!selectedId}
+                  />
+                  <span>{selectedId ? "보관 처리" : "생성 후 설정 가능"}</span>
+                </label>
+              </div>
+            </div>
+
+            {selectedId && accounts.length > 1 && (
+              <div className="space-y-2 rounded border border-dashed border-gray-300 p-3 text-xs text-gray-600">
+                <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                  <span className="font-medium text-gray-700">다른 계좌로 거래 통합</span>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <select
+                      value={mergeTargetId === "" ? "" : String(mergeTargetId)}
+                      onChange={(e) =>
+                        setMergeTargetId(e.target.value ? Number(e.target.value) : "")
+                      }
+                      className="rounded border px-2 py-1 text-sm"
+                      disabled={mergeBusy}
+                    >
+                      <option value="">대상 계좌 선택</option>
+                      {accounts
+                        .filter((acc) => acc.id !== selectedId)
+                        .map((acc) => (
+                          <option key={acc.id} value={acc.id}>
+                            #{acc.id} {acc.name}
+                          </option>
+                        ))}
+                    </select>
+                    <button
+                      type="button"
+                      onClick={handleMerge}
+                      className="rounded border border-indigo-400 px-3 py-1 text-sm font-medium text-indigo-600 hover:bg-indigo-50 disabled:opacity-50"
+                      disabled={mergeBusy || !mergeTargetId}
+                    >
+                      {mergeBusy ? "통합 중…" : "통합 실행"}
+                    </button>
+                  </div>
+                </div>
+                <p className="text-[11px] text-gray-500">
+                  선택한 계좌의 거래·예산·정기 규칙이 대상 계좌로 이동하며, 원본 계좌는 보관 처리됩니다.
+                </p>
+              </div>
+            )}
+
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <button
+                type="button"
+                onClick={() => {
+                  resetForm();
+                  setMessage(null);
+                  setError(null);
+                }}
+                className="rounded border px-3 py-1 text-sm hover:bg-gray-50"
+                disabled={isBusy}
+              >
+                새 계좌 모드
+              </button>
+              <div className="flex items-center gap-2">
+                {selectedId && (
+                  <button
+                    type="button"
+                    onClick={handleDelete}
+                    className="rounded border border-red-400 px-3 py-1 text-sm text-red-600 hover:bg-red-50"
+                    disabled={isBusy}
+                  >
+                    {isDeleteBusy ? "삭제 중…" : "삭제"}
+                  </button>
+                )}
+                <button
+                  type="submit"
+                  className="rounded border border-blue-500 bg-blue-500 px-3 py-1 text-sm font-medium text-white hover:bg-blue-600 disabled:opacity-50"
+                    disabled={isBusy}
+                >
+                  {isFormBusy ? "처리 중…" : selectedId ? "변경 저장" : "계좌 추가"}
+                </button>
+              </div>
+            </div>
+          </form>
+          </SectionCard>
+        </StickyAside>
+      </div>
+
+      {selectedId ? (
+        <SectionCard title="계좌 상세 정보" description="선택한 계좌의 거래 내역과 잔액을 관리합니다.">
+          <div className="space-y-6">
+          {(() => {
+            const acc = accounts.find((a) => a.id === selectedId) || null;
+            if (!acc || acc.type !== "CREDIT_CARD" || !ccSummary) return null;
+            return (
+              <div className="rounded-md border bg-white p-3 shadow-sm">
+                <div className="flex items-center justify-between">
+                  <div>
+                    <div className="text-xs text-gray-600">미결제 금액</div>
+                    <div className="text-xl font-semibold tabular-nums">{formatBalance(ccSummary.outstanding_amount)} 원</div>
+                  </div>
+                  <div className="text-right">
+                    <div className="text-xs text-gray-600">다음 결제일</div>
+                    <div className="text-xl font-semibold">
+                      {ccSummary.next_due_date ? new Date(ccSummary.next_due_date).toLocaleDateString() : "-"}
+                    </div>
+                  </div>
+                </div>
+                {ccSummary.active_statement && (
+                  <div className="mt-1 text-[11px] text-gray-500">
+                    청구기간: {new Date(ccSummary.active_statement.period_start).toLocaleDateString()} ~ {new Date(ccSummary.active_statement.period_end).toLocaleDateString()} · 상태: {ccSummary.active_statement.status}
+                    <button
+                      type="button"
+                      className="ml-2 rounded border px-2 py-0.5 text-[11px] hover:bg-gray-50"
+                      onClick={() => setStatementDetailId(ccSummary.active_statement!.id)}
+                    >
+                      명세 상세 보기
+                    </button>
+                    <button
+                      type="button"
+                      className="ml-2 rounded border border-indigo-400 bg-indigo-500 px-2 py-0.5 text-[11px] font-medium text-white hover:bg-indigo-600 disabled:opacity-60"
+                      disabled={settleBusy || ccSummary.active_statement.status !== "pending"}
+                      onClick={() => ccSummary.active_statement && handleSettle(ccSummary.active_statement.id)}
+                    >
+                      {settleBusy ? "정산 중…" : "정산 실행"}
+                    </button>
+                  </div>
+                )}
+              </div>
+            );
+          })()}
+
+          {(() => {
+            const acc = accounts.find((a) => a.id === selectedId) || null;
+            if (!acc || acc.type !== "CREDIT_CARD") return null;
+            const pendings = (ccStatements || []).filter((s) => s.status === "pending");
+            if (pendings.length === 0) return null;
+            const earliestDue = pendings
+              .map((s) => new Date(s.due_date))
+              .filter((d) => !Number.isNaN(d.getTime()))
+              .sort((a, b) => a.getTime() - b.getTime())[0];
+            return (
+              <div className="rounded border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800">
+                미정산 명세 {pendings.length.toLocaleString()}건이 있습니다.
+                {earliestDue ? (
+                  <span className="ml-2">가장 빠른 결제일: <strong>{earliestDue.toLocaleDateString()}</strong></span>
+                ) : null}
+              </div>
+            );
+          })()}
+
+          {(() => {
+            const acc = accounts.find((a) => a.id === selectedId) || null;
+            if (!acc || acc.type !== "CREDIT_CARD") return null;
+            return (
+              <div className="rounded border bg-white shadow-sm">
+                <div className="flex items-center justify-between border-b px-3 py-2">
+                  <h3 className="text-sm font-semibold text-gray-800">명세 목록</h3>
+                  <div className="text-xs text-gray-500">총 {(ccStatements?.length ?? 0).toLocaleString()}건</div>
+                </div>
+                <div className="overflow-x-auto">
+                  <table className="min-w-full text-sm">
+                    <thead className="border-b bg-gray-50 text-xs uppercase text-gray-600">
+                      <tr>
+                        <th className="px-3 py-2 text-left">ID</th>
+                        <th className="px-3 py-2 text-left">청구기간</th>
+                        <th className="px-3 py-2 text-left">결제일</th>
+                        <th className="px-3 py-2 text-right">금액</th>
+                        <th className="px-3 py-2 text-left">상태</th>
+                        <th className="px-3 py-2 text-left">액션</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {(!ccStatements || ccStatements.length === 0) && (
+                        <tr>
+                          <td colSpan={6} className="px-3 py-4 text-center text-gray-500">표시할 명세가 없습니다.</td>
+                        </tr>
+                      )}
+                      {ccStatements && ccStatements.map((s) => (
+                        <tr key={s.id} className="border-b last:border-0 hover:bg-gray-50">
+                          <td className="px-3 py-2">{s.id}</td>
+                          <td className="px-3 py-2">
+                            {new Date(s.period_start).toLocaleDateString()} ~ {new Date(s.period_end).toLocaleDateString()}
+                          </td>
+                          <td className="px-3 py-2">{new Date(s.due_date).toLocaleDateString()}</td>
+                          <td className="px-3 py-2 text-right tabular-nums">{formatBalance(s.total_amount)}</td>
+                          <td className="px-3 py-2 text-xs">
+                            <span className={s.status === 'pending' ? 'text-amber-700' : s.status === 'paid' ? 'text-emerald-700' : 'text-gray-700'}>
+                              {s.status}
+                            </span>
+                          </td>
+                          <td className="px-3 py-2 text-xs">
+                            <button
+                              type="button"
+                              className="mr-2 rounded border px-2 py-0.5 hover:bg-gray-50"
+                              onClick={() => setStatementDetailId(s.id)}
+                            >
+                              상세
+                            </button>
+                            <button
+                              type="button"
+                              className="rounded border border-indigo-400 bg-indigo-500 px-2 py-0.5 font-medium text-white hover:bg-indigo-600 disabled:opacity-60"
+                              disabled={settleBusy || s.status !== 'pending'}
+                              onClick={() => handleSettle(s.id)}
+                            >
+                              정산
+                            </button>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            );
+          })()}
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <h3 className="text-base font-semibold text-gray-800">Transactions</h3>
+              <p className="text-xs text-gray-500">계좌 #{selectedId} - 총 {transactions.length.toLocaleString()}건</p>
+              <p className="text-xs text-gray-500">
+                초기 잔액: <strong className="tabular-nums text-gray-800">{formatBalance(initialBalanceValue)}</strong>
+                <span className="mx-1 text-gray-400">/</span>
+                현재 잔액: <strong className="tabular-nums text-gray-800">{formatBalance(currentBalanceValue)}</strong>
+              </p>
+            </div>
+            <div className="flex flex-wrap items-center gap-3 text-sm text-gray-600">
+              <span>선택 {selectedTransactionCount.toLocaleString()}건</span>
+              {selectedTransactionCount > 0 && (
+                <span>
+                  합계 <strong className="tabular-nums">{formatBalance(selectedTransactionsAmount)}</strong>
+                </span>
+              )}
+            </div>
+          </div>
+
+          {transactionsError && (
+            <div className="rounded border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">{transactionsError}</div>
+          )}
+
+          <div className="rounded border bg-white shadow-sm">
+            {statementDetailId && (() => {
+              const s = statementMap.get(statementDetailId!);
+              if (!s) return null;
+              return (
+                <div className="border-b bg-amber-50 px-3 py-2 text-xs text-amber-800">
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <span className="font-semibold">명세 #{s.id}</span>
+                      <span className="ml-2">기간 {new Date(s.period_start).toLocaleDateString()} ~ {new Date(s.period_end).toLocaleDateString()}</span>
+                      <span className="ml-2">결제일 {new Date(s.due_date).toLocaleDateString()}</span>
+                      <span className="ml-2">금액 {formatBalance(s.total_amount)}원</span>
+                      <span className="ml-2">상태 {s.status}</span>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        className="rounded border border-indigo-400 bg-indigo-500 px-2 py-0.5 text-[11px] font-medium text-white hover:bg-indigo-600 disabled:opacity-60"
+                        disabled={settleBusy || s.status !== "pending"}
+                        onClick={() => handleSettle(s.id)}
+                      >
+                        {settleBusy ? "정산 중…" : "이 명세 정산"}
+                      </button>
+                      <button
+                        type="button"
+                        className="rounded border px-2 py-0.5 text-[11px] hover:bg-gray-50"
+                        onClick={() => setStatementDetailId(null)}
+                      >
+                        닫기
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              );
+            })()}
+            <div className="flex flex-wrap items-center justify-between gap-3 border-b px-3 py-2 text-sm text-gray-700">
+              <div className="flex items-center gap-2">
+                <label className="inline-flex items-center gap-1 text-xs text-gray-600">
+                  <input
+                    type="checkbox"
+                    checked={isAllTransactionsSelected}
+                    onChange={(event) => toggleAllTransactions(event.target.checked)}
+                    disabled={displayTransactions.length === 0 || transactionsLoading}
+                  />
+                  <span>전체 선택</span>
+                </label>
+                {transactionsLoading && <span className="text-xs text-gray-500">불러오는 중…</span>}
+              </div>
+              <div className="flex flex-wrap items-center gap-2">
+                <select
+                  value={moveTargetId === "" ? "" : String(moveTargetId)}
+                  onChange={(event) => setMoveTargetId(event.target.value ? Number(event.target.value) : "")}
+                  className="rounded border px-2 py-1 text-sm"
+                  disabled={moveBusy || transactionsLoading || moveCandidates.length === 0}
+                >
+                  <option value="">이동 대상 계좌 선택</option>
+                  {moveCandidates.map((account) => (
+                    <option key={account.id} value={account.id}>
+                      #{account.id} {account.name}
+                    </option>
+                  ))}
+                </select>
+                <button
+                  type="button"
+                  onClick={handleMoveTransactions}
+                  className="rounded border border-indigo-400 bg-indigo-500 px-3 py-1 text-sm font-medium text-white hover:bg-indigo-600 disabled:opacity-60"
+                  disabled={moveDisabled}
+                >
+                  {moveBusy ? "이동 중…" : "선택 항목 이동"}
+                </button>
+              </div>
+            </div>
+
+            <div className="overflow-x-auto">
+              <table className="min-w-full text-sm">
+                <thead className="border-b bg-gray-50 text-xs uppercase text-gray-600">
+                  <tr>
+                    <th className="px-3 py-2 text-left">선택</th>
+                    <th className="px-3 py-2 text-left">
+                      <button
+                        type="button"
+                        onClick={() => handleTransactionSort("occurred_at")}
+                        className="inline-flex items-center gap-1 font-semibold text-gray-700"
+                      >
+                        <span>일자</span>
+                        <span className="text-[11px] text-gray-500">
+                          {transactionSort.key === "occurred_at" ? (transactionSort.order === "desc" ? "▼" : "▲") : "↕"}
+                        </span>
+                      </button>
+                    </th>
+                    <th className="px-3 py-2 text-left">시간</th>
+                    <th className="px-3 py-2 text-left">유형</th>
+                    <th className="px-3 py-2 text-right">
+                      <button
+                        type="button"
+                        onClick={() => handleTransactionSort("amount")}
+                        className="inline-flex w-full items-center justify-end gap-1 font-semibold text-gray-700"
+                      >
+                        <span>금액</span>
+                        <span className="text-[11px] text-gray-500">
+                          {transactionSort.key === "amount" ? (transactionSort.order === "desc" ? "▼" : "▲") : "↕"}
+                        </span>
+                      </button>
+                    </th>
+                    <th className="px-3 py-2 text-right">잔액</th>
+                    <th className="px-3 py-2 text-left">통화</th>
+                    <th className="px-3 py-2 text-left">상대 계좌</th>
+                    <th className="px-3 py-2 text-left">메모</th>
+                    <th className="px-3 py-2 text-left">외부 ID</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {transactionsLoading && (
+                    <tr>
+                      <td colSpan={10} className="px-3 py-6 text-center text-gray-500">불러오는 중…</td>
+                    </tr>
+                  )}
+                  {!transactionsLoading && displayTransactions.length === 0 && (
+                    <tr>
+                      <td colSpan={10} className="px-3 py-6 text-center text-gray-500">표시할 거래가 없습니다.</td>
+                    </tr>
+                  )}
+                  {!transactionsLoading && displayTransactions.map((tx) => {
+                    const isRowSelected = selectedTransactionIds.has(tx.id);
+                    const counterName = tx.counter_account_id ? accountNameMap.get(tx.counter_account_id)?.name ?? `#${tx.counter_account_id}` : "-";
+                    const amountClass = tx.amount < 0 ? "text-red-600" : tx.amount > 0 ? "text-blue-600" : "text-gray-700";
+                    const runningBalance = runningBalanceMap.get(tx.id);
+                    return (
+                      <tr key={tx.id} className={`border-b last:border-0 ${isRowSelected ? "bg-indigo-50" : "hover:bg-gray-50"}`}>
+                        <td className="px-3 py-2">
+                          <input
+                            type="checkbox"
+                            checked={isRowSelected}
+                            onChange={() => toggleTransactionSelection(tx.id)}
+                          />
+                        </td>
+                        <td className="px-3 py-2">{tx.occurred_at}</td>
+                        <td className="px-3 py-2 text-xs text-gray-500">{tx.occurred_time ?? "-"}</td>
+                        <td className="px-3 py-2 text-xs">
+                          {(() => {
+                            const acc = accounts.find((a) => a.id === selectedId) || null;
+                            const { label, tone } = labelTxnKind(tx, acc?.type ?? "DEPOSIT");
+                            const statement = tx.billing_cycle_id ? statementMap.get(tx.billing_cycle_id) : null;
+                            const badge = (
+                              <span
+                                className={`${tone} inline-flex items-center gap-1`}
+                                title={statement ? `명세 #${statement.id} · ${new Date(statement.period_start).toLocaleDateString()} ~ ${new Date(statement.period_end).toLocaleDateString()}` : undefined}
+                              >
+                                <span>{label}</span>
+                                {statement && (
+                                  <button
+                                    type="button"
+                                    className="ml-1 rounded border px-1 text-[10px] text-gray-700 hover:bg-gray-50"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      setStatementDetailId(statement.id);
+                                    }}
+                                  >
+                                    명세 #{statement.id}
+                                  </button>
+                                )}
+                              </span>
+                            );
+                            return badge;
+                          })()}
+                        </td>
+                        <td className={`px-3 py-2 text-right tabular-nums ${amountClass}`}>{formatBalance(tx.amount)}</td>
+                        <td className="px-3 py-2 text-right tabular-nums text-gray-700">{runningBalance === undefined ? "-" : formatBalance(runningBalance)}</td>
+                        <td className="px-3 py-2 text-xs text-gray-500">{tx.currency}</td>
+                        <td className="px-3 py-2 text-xs text-gray-600">{counterName}</td>
+                        <td className="px-3 py-2 text-xs text-gray-600">{tx.memo ?? "-"}</td>
+                        <td className="px-3 py-2 text-xs text-gray-500">{tx.external_id ?? "-"}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </div>
+          </div>
+        </SectionCard>
+      ) : (
+        <SectionCard tone="muted">
+          <p className="text-sm text-gray-500 text-center">상세 거래를 보려면 계좌를 선택하세요.</p>
+        </SectionCard>
+      )}
+    </div>
+  );
+}

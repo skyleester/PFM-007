@@ -19,6 +19,10 @@ dependencies = [
     "tzdata>=2024.1",
 ]
 
+[tool.setuptools.packages.find]
+include = ["app*"]
+exclude = ["tests*"]
+
 [tool.uvicorn]
 app = "app.main:app"
 host = "127.0.0.1"

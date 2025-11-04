@@ -23,6 +23,8 @@ const sampleRule: RecurringRule = {
   end_date: null,
   is_active: true,
   last_generated_at: "2024-08-01",
+  is_variable_amount: false,
+  pending_occurrences: [],
 };
 
 function renderTable(overrides: Partial<RecurringRuleTableProps> = {}) {

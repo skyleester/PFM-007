@@ -20,6 +20,8 @@ __pycache__/
 # ---------------------------
 # Python / FastAPI / Alembic
 # ---------------------------
+ .venv/
+ .tox/
 *.db
 *.sqlite3*
 *.wal
@@ -30,15 +32,20 @@ instance/
 .pytest_cache/
 coverage/
 htmlcov/
+ .coverage
+ .coverage.*
 apps/backend/__pycache__/
 apps/backend/alembic/__pycache__/
 apps/backend/app/__pycache__/
+ # Alembic squash backup folders (do not commit)
+ apps/backend/alembic/versions_bak_*/
 
 # ---------------------------
 # Node / Next.js / Frontend
 # ---------------------------
 node_modules/
 .next/
+.turbo/
 .vercel/
 dist/
 build/
@@ -47,6 +54,7 @@ yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
 *.tsbuildinfo
+ .eslintcache
 
 # ---------------------------
 # Local development / Editor
@@ -71,3 +79,4 @@ COPILOT_INSTRUCTIONS.md
 backups/*.db
 backups/*.sqlite3
 backups/*.bak
+ # keep backups/metadata.json tracked

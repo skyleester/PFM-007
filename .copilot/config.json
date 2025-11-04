@@ -1,0 +1,32 @@
+{
+  "$schema": "https://schemas.github.com/copilot/configuration/1.0",
+  "version": 1,
+  "ignore": [
+    "apps/backend/alembic/versions/**",
+    "apps/backend/alembic/versions_bak_*/**",
+    "apps/backend/alembic/env.py",
+    "apps/backend/alembic/script.py.mako",
+    ".env",
+    ".env.*",
+    "alembic.ini",
+    ".venv/**",
+    "node_modules/**",
+    ".next/**",
+    "dist/**",
+    "build/**",
+    "**/__pycache__/**",
+    "**/.pytest_cache/**",
+    "**/.mypy_cache/**",
+    "**/.ruff_cache/**",
+    "tests/data/**",
+    "tests/fixtures/**"
+  ],
+  "default_openai_model": "gpt-5",
+  "policies": {
+    "comment_style": "concise",
+    "code_generation": {
+      "max_edits_per_file": 20,
+      "require_confirmation_for_large_edits": true
+    }
+  }
+}

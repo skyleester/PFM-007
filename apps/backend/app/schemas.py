@@ -6,11 +6,20 @@ from datetime import date, time, datetime
 import datetime as dt
 from typing import Optional, Literal, Any
 
-from pydantic import BaseModel, Field, field_validator, model_validator, ConfigDict, EmailStr, computed_field
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    ConfigDict,
+    EmailStr,
+    Field,
+    computed_field,
+    field_validator,
+    model_validator,
+)
 
 from .models import (
     AccountType,
-    BalanceType,
+    AccountUnifiedType,
     TxnType,
     RecurringFrequency,
     CalendarEventType,
@@ -85,38 +94,74 @@ class MemberUpdate(BaseModel):
     is_active: bool | None = None
 
 
+class CreditCardTerms(BaseModel):
+    billing_cutoff_day: int = Field(ge=1, le=31)
+    payment_day: int = Field(ge=1, le=31)
+
+
 class AccountCreate(BaseModel):
     user_id: int
     name: str = Field(min_length=1, max_length=100)
     type: AccountType
     currency: Optional[str] = Field(default=None, min_length=3, max_length=3)
-    balance: Optional[float] = 0
+    category: Optional[str] = Field(default=None, max_length=50)
+    institution: Optional[str] = Field(default=None, max_length=120)
+    current_balance: float = Field(
+        default=0,
+        validation_alias=AliasChoices("current_balance", "balance"),
+    )
+    available_balance: Optional[float] = None
+    credit_limit: Optional[float] = None
     linked_account_id: Optional[int] = None
-    auto_deduct: bool = False
+    opened_at: Optional[date] = None
+    closed_at: Optional[date] = None
+    memo: Optional[str] = Field(default=None, max_length=500)
+    extra_metadata: dict[str, Any] | None = None
+    credit_card_terms: CreditCardTerms | None = None
+    auto_deduct: Optional[bool] = None
     billing_cutoff_day: Optional[int] = Field(default=None, ge=1, le=31)
     payment_day: Optional[int] = Field(default=None, ge=1, le=31)
 
+    model_config = ConfigDict(extra="ignore")
+
     @model_validator(mode="after")
-    def validate_linked_account(cls, values):
-        if values.type == AccountType.CHECK_CARD:
-            if values.auto_deduct and not values.linked_account_id:
-                raise ValueError("linked_account_id is required when auto_deduct is enabled")
-            if values.billing_cutoff_day is not None or values.payment_day is not None:
-                raise ValueError("billing/payment days are only allowed for credit card accounts")
-        elif values.type == AccountType.CREDIT_CARD:
-            if not values.linked_account_id:
+    def validate_account(cls, values: "AccountCreate") -> "AccountCreate":
+        auto_deduct = bool(values.auto_deduct) if values.auto_deduct is not None else False
+
+        if values.type is AccountType.CREDIT_CARD:
+            if values.linked_account_id is None:
                 raise ValueError("linked_account_id is required for credit card accounts")
-            if values.billing_cutoff_day is None or values.payment_day is None:
-                raise ValueError("billing_cutoff_day and payment_day are required for credit card accounts")
-            if values.auto_deduct:
-                raise ValueError("auto_deduct is not supported for credit card accounts")
+            terms = values.credit_card_terms
+            if terms is None:
+                if values.billing_cutoff_day is None or values.payment_day is None:
+                    raise ValueError("credit card accounts require billing_cutoff_day and payment_day")
+                terms = CreditCardTerms(
+                    billing_cutoff_day=values.billing_cutoff_day,
+                    payment_day=values.payment_day,
+                )
+                values.credit_card_terms = terms
+            metadata = dict(values.extra_metadata or {})
+            metadata.setdefault("billing_cutoff_day", values.credit_card_terms.billing_cutoff_day)
+            metadata.setdefault("payment_day", values.credit_card_terms.payment_day)
+            values.extra_metadata = metadata
         else:
-            if values.linked_account_id is not None:
-                raise ValueError("linked_account_id is only allowed for CHECK_CARD accounts")
-            if values.auto_deduct:
-                raise ValueError("auto_deduct is only available for CHECK_CARD accounts")
+            if values.credit_card_terms is not None:
+                raise ValueError("credit_card_terms is only allowed for credit card accounts")
             if values.billing_cutoff_day is not None or values.payment_day is not None:
-                raise ValueError("billing/payment days are only allowed for credit card accounts")
+                raise ValueError("billing_cutoff_day/payment_day are only allowed for credit card accounts")
+        if values.type is AccountType.CHECK_CARD:
+            if auto_deduct and (values.linked_account_id is None):
+                # Enforce at schema level for 422 as tests expect
+                raise ValueError("auto_deduct requires a linked deposit account")
+            if values.auto_deduct is None:
+                values.auto_deduct = False
+        else:
+            if auto_deduct:
+                raise ValueError("auto_deduct is only allowed for CHECK_CARD accounts")
+            values.auto_deduct = False
+
+        if values.extra_metadata is None:
+            values.extra_metadata = {}
         return values
 
 
@@ -125,19 +170,66 @@ class AccountOut(BaseModel):
     user_id: int
     name: str
     type: AccountType
-    account_type: AccountType
+    category: Optional[str]
+    institution: Optional[str]
     currency: Optional[str]
-    balance: float
-    is_archived: bool
+    current_balance: float
+    available_balance: Optional[float]
+    credit_limit: Optional[float]
     linked_account_id: Optional[int]
-    balance_type: BalanceType
-    auto_deduct: bool
-    billing_cutoff_day: Optional[int]
-    payment_day: Optional[int]
+    is_active: bool
+    opened_at: Optional[date]
+    closed_at: Optional[date]
+    memo: Optional[str]
+    extra_metadata: dict[str, Any]
     created_at: datetime
     updated_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
+
+    @computed_field(return_type=float, alias="balance")
+    def balance(self) -> float:
+        return float(self.current_balance)
+
+    @computed_field(return_type=AccountType, alias="account_type")
+    def account_type(self) -> AccountType:
+        return self.type
+
+    @computed_field(return_type=bool, alias="is_archived")
+    def is_archived(self) -> bool:
+        return not self.is_active
+
+    @computed_field(return_type=bool, alias="auto_deduct")
+    def auto_deduct(self) -> bool:
+        metadata = self.extra_metadata or {}
+        raw = metadata.get("auto_deduct")
+        if isinstance(raw, bool):
+            return raw
+        if isinstance(raw, (int, float)):
+            return bool(raw)
+        if isinstance(raw, str):
+            lowered = raw.strip().lower()
+            return lowered in {"1", "true", "yes", "y", "on"}
+        return False
+
+    @computed_field(return_type=int | None, alias="billing_cutoff_day")
+    def billing_cutoff_day(self) -> int | None:
+        metadata = self.extra_metadata or {}
+        value = metadata.get("billing_cutoff_day")
+        return int(value) if value is not None else None
+
+    @computed_field(return_type=int | None, alias="payment_day")
+    def payment_day(self) -> int | None:
+        metadata = self.extra_metadata or {}
+        value = metadata.get("payment_day")
+        return int(value) if value is not None else None
+
+    @computed_field(return_type=AccountUnifiedType | None, alias="unified_type")
+    def unified_type(self) -> AccountUnifiedType | None:
+        try:
+            return AccountType.unified_bucket(self.type)
+        except Exception:
+            return None
 
 
 class AccountMergeRequest(BaseModel):
@@ -234,14 +326,29 @@ class TransactionCreate(BaseModel):
     occurred_at: date
     occurred_time: Optional[time] = None
     type: TxnType
-    account_id: Optional[int] = None
-    account_name: Optional[str] = None  # 이름으로 등록/검색 지원
-    counter_account_id: Optional[int] = None
-    counter_account_name: Optional[str] = None
-    card_id: Optional[int] = None
+    from_account_id: Optional[int] = Field(
+        default=None,
+        validation_alias=AliasChoices("from_account_id", "account_id"),
+    )
+    from_account_name: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("from_account_name", "account_name"),
+    )
+    to_account_id: Optional[int] = Field(
+        default=None,
+        validation_alias=AliasChoices("to_account_id", "counter_account_id"),
+    )
+    to_account_name: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("to_account_name", "counter_account_name"),
+    )
+    card_account_id: Optional[int] = Field(
+        default=None,
+        validation_alias=AliasChoices("card_account_id", "card_id"),
+    )
     category_id: Optional[int] = None
-    category_group_name: Optional[str] = None  # 대분류 이름
-    category_name: Optional[str] = None  # 소분류 이름
+    category_group_name: Optional[str] = None
+    category_name: Optional[str] = None
     amount: float
     currency: str
     memo: Optional[str] = None
@@ -251,71 +358,163 @@ class TransactionCreate(BaseModel):
     transfer_flow: Optional[Literal["OUT", "IN"]] = None
     exclude_from_reports: bool = False
     is_card_charge: bool = False
+    is_balance_neutral: bool = False
     billing_cycle_id: Optional[int] = None
+    model_config = ConfigDict(extra="ignore")
+
+    @model_validator(mode="before")
+    def _pre_normalize_legacy(cls, values: dict):
+        # Normalize legacy keys into directional ones before field validation
+        t = values.get("type")
+        acc = values.get("account_id")
+        cnt = values.get("counter_account_id")
+        card = values.get("card_id")
+        acc_name = values.get("account_name")
+        cnt_name = values.get("counter_account_name")
+
+        if card is not None and values.get("card_account_id") is None:
+            values["card_account_id"] = card
+
+        # Map legacy account_id according to transaction type
+        if acc is not None and not values.get("from_account_id") and not values.get("to_account_id"):
+            if t in (TxnType.INCOME, TxnType.SETTLEMENT):
+                values["to_account_id"] = acc
+            else:
+                values["from_account_id"] = acc
+
+        if cnt is not None and not values.get("to_account_id"):
+            values["to_account_id"] = cnt
+
+        # Map legacy name fields similarly
+        if acc_name and not values.get("from_account_name") and not values.get("to_account_name"):
+            if t in (TxnType.INCOME, TxnType.SETTLEMENT):
+                values["to_account_name"] = acc_name
+            else:
+                values["from_account_name"] = acc_name
+        if cnt_name and not values.get("to_account_name"):
+            values["to_account_name"] = cnt_name
+
+        # Normalize transfer_flow to upper-case for downstream logic
+        if isinstance(values.get("transfer_flow"), str):
+            values["transfer_flow"] = values["transfer_flow"].upper()
+
+        # Remove legacy keys to avoid alias double-mapping into from_/to_ fields
+        values.pop("account_id", None)
+        values.pop("counter_account_id", None)
+        values.pop("account_name", None)
+        values.pop("counter_account_name", None)
+
+        return values
 
     @field_validator("currency")
-    def currency_len(cls, v: str):
+    def currency_len(cls, v: str) -> str:
         if len(v) != 3:
             raise ValueError("currency must be 3-letter code")
         return v.upper()
 
     @field_validator("amount")
-    def validate_amount(cls, v: float):
+    def validate_amount(cls, v: float) -> float:
         if not math.isfinite(v):
             raise ValueError("amount must be finite")
         return v
 
-    @field_validator("counter_account_id")
-    def transfer_counter_optional(cls, v, info):
-        # 단일 전표(상대 계정 없음) TRANSFER도 허용하기 위해 검증 완화
-        return v
-
     @model_validator(mode="after")
-    def validate_references(self):
-        # account: account_id 또는 account_name 둘 중 하나는 필요
-        if not self.account_id and not self.account_name:
-            raise ValueError("account_id or account_name is required")
+    def validate_references(self) -> "TransactionCreate":
+        if not self.from_account_id and not self.from_account_name and not self.to_account_id and not self.to_account_name:
+            raise ValueError("at least one of from_account or to_account identifiers is required")
 
-        if self.type in (TxnType.INCOME, TxnType.EXPENSE):
-            # category: INCOME/EXPENSE에서는 category_id 또는 (category_group_name & category_name) 필요
-            if not self.category_id and not (self.category_group_name and self.category_name):
-                raise ValueError("category_id or (category_group_name & category_name) is required for income/expense")
-        elif self.type == TxnType.TRANSFER:
-            # transfer는 카테고리 선택 사항이지만, 부분 입력은 금지
+        if self.type in (TxnType.EXPENSE, TxnType.SETTLEMENT):
+            if not (self.from_account_id or self.from_account_name):
+                raise ValueError("expense/settlement requires from_account")
+        if self.type in (TxnType.INCOME, TxnType.SETTLEMENT):
+            if not (self.to_account_id or self.to_account_name):
+                raise ValueError("income/settlement requires to_account")
+        if self.type == TxnType.TRANSFER:
+            # Backward compatibility: allow single-sided transfers; pairing service will resolve
+            # If both provided, ensure not identical when both are ints
+            if self.from_account_id and self.to_account_id and self.from_account_id == self.to_account_id:
+                raise ValueError("transfer from/to accounts must differ")
             if bool(self.category_group_name) ^ bool(self.category_name):
-                raise ValueError("TRANSFER requires both category_group_name and category_name when provided")
-            if self.transfer_flow and self.transfer_flow not in ("OUT", "IN"):
-                raise ValueError("transfer_flow must be OUT or IN")
-        elif self.type == TxnType.SETTLEMENT:
-            if not self.card_id:
-                raise ValueError("card_id is required for settlement")
+                raise ValueError("transfer requires both category names when provided")
+        if self.transfer_flow and self.transfer_flow not in ("OUT", "IN"):
+            raise ValueError("transfer_flow must be OUT or IN")
+
+        if self.type in (TxnType.INCOME, TxnType.EXPENSE) and not self.category_id and not (
+            self.category_group_name and self.category_name
+        ):
+            raise ValueError("category reference required for income/expense")
+
+        if self.type == TxnType.SETTLEMENT:
             if self.transfer_flow is not None:
-                raise ValueError("transfer_flow is not allowed for settlement")
+                raise ValueError("settlement cannot carry transfer_flow")
+            if self.billing_cycle_id is None:
+                raise ValueError("settlement requires billing_cycle_id")
+            if self.card_account_id is None:
+                raise ValueError("settlement requires card_account_id")
             if self.is_card_charge:
                 raise ValueError("settlement cannot be marked as card charge")
-            if self.billing_cycle_id is None:
-                raise ValueError("billing_cycle_id is required for settlement")
-        else:
-            if self.transfer_flow is not None:
-                raise ValueError("transfer_flow is only allowed for transfers")
 
-        if self.is_card_charge and self.type != TxnType.EXPENSE:
-            raise ValueError("card charges must be EXPENSE transactions")
-        if self.is_card_charge and not self.card_id:
-            raise ValueError("card charges require card_id")
+        if self.is_card_charge:
+            if self.type is not TxnType.EXPENSE:
+                raise ValueError("card charges must be EXPENSE transactions")
+            if self.card_account_id is None:
+                raise ValueError("card charges require card_account_id")
+
         return self
+
+    @computed_field(return_type=int | None)
+    def account_id(self) -> int | None:
+        # For legacy compatibility on input, surface the primary side by type
+        if self.type == TxnType.INCOME:
+            return self.to_account_id
+        return self.from_account_id
+
+    @computed_field(return_type=str | None)
+    def account_name(self) -> str | None:
+        if self.type == TxnType.INCOME:
+            return self.to_account_name
+        return self.from_account_name
+
+    @computed_field(return_type=int | None)
+    def counter_account_id(self) -> int | None:
+        if self.type == TxnType.INCOME:
+            return self.from_account_id
+        return self.to_account_id
+
+    @computed_field(return_type=str | None)
+    def counter_account_name(self) -> str | None:
+        if self.type == TxnType.INCOME:
+            return self.from_account_name
+        return self.to_account_name
+
+    @computed_field(return_type=int | None)
+    def card_id(self) -> int | None:
+        return self.card_account_id
 
 
 class AccountUpdate(BaseModel):
     name: Optional[str] = Field(default=None, min_length=1, max_length=100)
     type: Optional[AccountType] = None
     currency: Optional[str] = Field(default=None, min_length=3, max_length=3)
-    balance: Optional[float] = None
-    is_archived: Optional[bool] = None
+    category: Optional[str] = Field(default=None, max_length=50)
+    institution: Optional[str] = Field(default=None, max_length=120)
+    current_balance: Optional[float] = Field(
+        default=None,
+        validation_alias=AliasChoices("current_balance", "balance"),
+    )
+    available_balance: Optional[float] = None
+    credit_limit: Optional[float] = None
     linked_account_id: Optional[int] = None
+    is_active: Optional[bool] = None
+    opened_at: Optional[date] = None
+    closed_at: Optional[date] = None
+    memo: Optional[str] = Field(default=None, max_length=500)
+    extra_metadata: Optional[dict[str, Any]] = None
+    credit_card_terms: Optional[CreditCardTerms] = None
     auto_deduct: Optional[bool] = None
     billing_cutoff_day: Optional[int] = Field(default=None, ge=1, le=31)
     payment_day: Optional[int] = Field(default=None, ge=1, le=31)
+    model_config = ConfigDict(extra="ignore")
 
 
 class CategoryUpdate(BaseModel):
@@ -334,19 +533,72 @@ class CategoryUpdate(BaseModel):
 class TransactionUpdate(BaseModel):
     occurred_at: Optional[date] = None
     occurred_time: Optional[time] = None
-    type: Optional[TxnType] = None  # 타입 변경 지원 (외부 이체 → 수입/지출 변환 등)
-    account_id: Optional[int] = None
-    counter_account_id: Optional[int] = None
+    type: Optional[TxnType] = None
+    from_account_id: Optional[int] = Field(
+        default=None,
+        validation_alias=AliasChoices("from_account_id", "account_id"),
+    )
+    to_account_id: Optional[int] = Field(
+        default=None,
+        validation_alias=AliasChoices("to_account_id", "counter_account_id"),
+    )
+    card_account_id: Optional[int] = Field(
+        default=None,
+        validation_alias=AliasChoices("card_account_id", "card_id"),
+    )
     category_id: Optional[int] = None
     amount: Optional[float] = None
     currency: Optional[str] = None
     memo: Optional[str] = None
     payee_id: Optional[int] = None
     exclude_from_reports: Optional[bool] = None
-    card_id: Optional[int] = None
     is_card_charge: Optional[bool] = None
     billing_cycle_id: Optional[int] = None
     imported_source_id: Optional[str] = Field(default=None, max_length=128)
+    model_config = ConfigDict(extra="ignore")
+
+    @model_validator(mode="before")
+    def _pre_normalize_legacy_update(cls, values: dict):
+        t = values.get("type")
+        acc = values.get("account_id")
+        cnt = values.get("counter_account_id")
+        card = values.get("card_id")
+        acc_name = values.get("account_name")
+        cnt_name = values.get("counter_account_name")
+
+        if card is not None and values.get("card_account_id") is None:
+            values["card_account_id"] = card
+
+        if acc is not None and not values.get("from_account_id") and not values.get("to_account_id"):
+            if t in (TxnType.INCOME, TxnType.SETTLEMENT):
+                values["to_account_id"] = acc
+            elif t in (TxnType.EXPENSE, TxnType.TRANSFER):
+                values["from_account_id"] = acc
+            else:
+                # Unknown type at update time: set both so downstream logic can resolve by current tx.type
+                values["from_account_id"] = acc
+                values["to_account_id"] = acc
+        if cnt is not None and not values.get("to_account_id"):
+            values["to_account_id"] = cnt
+        if acc_name and not values.get("from_account_name") and not values.get("to_account_name"):
+            if t in (TxnType.INCOME, TxnType.SETTLEMENT):
+                values["to_account_name"] = acc_name
+            elif t in (TxnType.EXPENSE, TxnType.TRANSFER):
+                values["from_account_name"] = acc_name
+            else:
+                values["from_account_name"] = acc_name
+                values["to_account_name"] = acc_name
+        if cnt_name and not values.get("to_account_name"):
+            values["to_account_name"] = cnt_name
+        if isinstance(values.get("transfer_flow"), str):
+            values["transfer_flow"] = values["transfer_flow"].upper()
+
+        # Remove legacy keys to avoid alias double-mapping
+        values.pop("account_id", None)
+        values.pop("counter_account_id", None)
+        values.pop("account_name", None)
+        values.pop("counter_account_name", None)
+        return values
 
 
 class BudgetUpdate(BaseModel):
@@ -366,9 +618,9 @@ class TransactionOut(BaseModel):
     occurred_time: Optional[time]
     type: TxnType
     group_id: Optional[int]
-    account_id: int
-    counter_account_id: Optional[int]
-    card_id: Optional[int]
+    from_account_id: Optional[int]
+    to_account_id: Optional[int]
+    card_account_id: Optional[int]
     category_id: Optional[int]
     amount: float
     currency: str
@@ -389,6 +641,23 @@ class TransactionOut(BaseModel):
     @computed_field(return_type=int | None, alias="statement_id")
     def statement_id(self) -> int | None:
         return self.billing_cycle_id
+
+    @computed_field(return_type=int | None, alias="account_id")
+    def account_id(self) -> int | None:
+        # For legacy compatibility, surface the primary side by type
+        if self.type == TxnType.INCOME:
+            return self.to_account_id
+        return self.from_account_id
+
+    @computed_field(return_type=int | None, alias="counter_account_id")
+    def counter_account_id(self) -> int | None:
+        if self.type == TxnType.INCOME:
+            return self.from_account_id
+        return self.to_account_id
+
+    @computed_field(return_type=int | None, alias="card_id")
+    def card_id(self) -> int | None:
+        return self.card_account_id
 
 
 class CreditCardStatementOut(BaseModel):
@@ -1183,3 +1452,49 @@ class CalendarEventOut(BaseModel):
     updated_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
+
+
+# ======================== Bulk Upload (Simple) ========================
+
+class ParsedTransactionIn(BaseModel):
+    """Client-parsed transaction shape used by the simple bulk-upload endpoint.
+
+    date: ISO datetime string; stored as occurred_at (date) and occurred_time (time, optional)
+    type: INCOME | EXPENSE | TRANSFER
+    amount: positive number; will be signed by type (EXPENSE -> negative)
+    category_main/sub: mapped to category_group_name/category_name when creating
+    description: mapped to memo if present; falls back to memo
+    account_name: human name to resolve/create account
+    currency: 3-letter code
+    """
+
+    date: datetime
+    type: TxnType
+    amount: float
+    memo: str | None = None
+    category_main: str | None = None
+    category_sub: str | None = None
+    description: str | None = None
+    account_name: str | None = None
+    currency: str = Field(default="KRW", min_length=3, max_length=3)
+
+    @field_validator("amount")
+    def amount_positive(cls, v: float) -> float:
+        if v is None or not math.isfinite(v):
+            raise ValueError("amount must be finite number")
+        if v <= 0:
+            raise ValueError("amount must be greater than 0")
+        return float(v)
+
+    @field_validator("currency")
+    def currency_upper(cls, v: str) -> str:
+        return (v or "KRW").upper()
+
+
+class TransactionImportResult(BaseModel):
+    total_count: int
+    success_count: int
+    failed_count: int
+    duplicates: int | None = 0
+    errors: list[dict] | None = []
+

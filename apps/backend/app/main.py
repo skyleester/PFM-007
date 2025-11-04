@@ -1,7 +1,8 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+
 from .core.config import settings
-from .routers import router
+from apps.backend.routers import register_routers
 
 app = FastAPI(title="PFM Backend", version="0.1.0")
 
@@ -28,4 +29,4 @@ def health():
     return {"status": "ok"}
 
 
-app.include_router(router, prefix="/api")
+register_routers(app)

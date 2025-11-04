@@ -6,8 +6,10 @@ Services 패키지
 
 from .transfer_pairing_service import TransferPairingService
 from .transaction_bulk_service import TransactionBulkService
+from .transaction_service import TransactionBalanceService
 
 __all__ = [
     "TransferPairingService",
     "TransactionBulkService",
+    "TransactionBalanceService",
 ]

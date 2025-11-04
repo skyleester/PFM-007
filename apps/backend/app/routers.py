@@ -565,6 +565,9 @@ def delete_calendar_event(
     return None
 
 
+# TODO(PHASE2): Transaction endpoints duplicated in routers/transactions.py for
+# modular rollout. Keep definitions here for comparison until legacy router is
+# fully retired.
 @router.get("/transactions", response_model=list[TransactionOut])
 def list_transactions(
     response: Response,
@@ -980,21 +983,6 @@ def _clear_linked_transaction_pointer(db: Session, tx: models.Transaction) -> No
     db.flush()
 
 
-def _resync_check_card_auto_deduct_for_account(
-    db: Session,
-    account: models.Account,
-    *,
-    force_remove: bool = False,
-) -> None:
-    txns = (
-        db.query(models.Transaction)
-        .filter(models.Transaction.account_id == account.id)
-        .all()
-    )
-    for tx in txns:
-        _sync_check_card_auto_deduct(db, tx, account=account, remove=force_remove)
-
-
 def _ensure_global_uncategorized_defaults(db: Session) -> None:
     """Ensure global default groups/categories (I/E/T 00-00 미분류) exist once."""
     for t in ("I", "E", "T"):
@@ -1160,10 +1148,9 @@ def get_or_create_account_by_name(db: Session, user_id: int, name: str) -> model
         user_id=user_id,
         name=name,
         type=models.AccountType.OTHER,
-        balance=0,
-        balance_type=models.BalanceType.DIRECT,
-        auto_deduct=False,
+        current_balance=0,
     )
+    acc.auto_deduct = False
     db.add(acc)
     db.flush()
     return acc
@@ -1305,461 +1292,6 @@ def get_or_create_category_by_names(
     db.flush()
     return cat
 
-@router.post("/accounts", response_model=AccountOut, status_code=201)
-def create_account(payload: AccountCreate, db: Session = Depends(get_db)):
-    exists = (
-        db.query(models.Account)
-        .filter(models.Account.user_id == payload.user_id, models.Account.name == payload.name)
-        .first()
-    )
-    if exists:
-        raise HTTPException(status_code=409, detail="Account with same name already exists for user")
-    data = payload.model_dump()
-    linked_id = data.get("linked_account_id")
-    auto_deduct = bool(data.get("auto_deduct"))
-    if payload.type == models.AccountType.CHECK_CARD:
-        if linked_id:
-            linked = db.query(models.Account).filter(models.Account.id == linked_id).first()
-            if not linked or linked.user_id != payload.user_id:
-                raise HTTPException(status_code=400, detail="Linked account must belong to the same user")
-            if linked.type != models.AccountType.DEPOSIT:
-                raise HTTPException(status_code=400, detail="Linked account must be a DEPOSIT account")
-            if data.get("currency") and linked.currency and data["currency"] != linked.currency:
-                raise HTTPException(status_code=400, detail="CHECK_CARD currency must match linked DEPOSIT currency")
-            if not data.get("currency") and linked.currency:
-                data["currency"] = linked.currency
-        else:
-            data["linked_account_id"] = None
-            auto_deduct = False
-            data["auto_deduct"] = False
-        if auto_deduct and not linked_id:
-            raise HTTPException(status_code=400, detail="auto_deduct requires a linked deposit account")
-        data["balance"] = 0.0
-        data["balance_type"] = models.BalanceType.LINKED
-        data["billing_cutoff_day"] = None
-        data["payment_day"] = None
-    elif payload.type == models.AccountType.CREDIT_CARD:
-        if not linked_id:
-            raise HTTPException(status_code=400, detail="Credit card requires a linked deposit account")
-        linked = db.query(models.Account).filter(models.Account.id == linked_id).first()
-        if not linked or linked.user_id != payload.user_id:
-            raise HTTPException(status_code=400, detail="Linked account must belong to the same user")
-        if linked.type != models.AccountType.DEPOSIT:
-            raise HTTPException(status_code=400, detail="Linked account must be a DEPOSIT account")
-        desired_currency = data.get("currency") or linked.currency
-        if desired_currency and linked.currency and desired_currency != linked.currency:
-            raise HTTPException(status_code=400, detail="CREDIT_CARD currency must match linked DEPOSIT currency")
-        data["currency"] = desired_currency
-        data["auto_deduct"] = False
-        data["balance"] = 0.0
-        data["balance_type"] = models.BalanceType.LINKED
-    else:
-        if linked_id is not None:
-            raise HTTPException(status_code=400, detail="linked_account_id is only allowed for card accounts")
-        data["linked_account_id"] = None
-        data["auto_deduct"] = False
-        data["balance_type"] = models.BalanceType.DIRECT
-        data["billing_cutoff_day"] = None
-        data["payment_day"] = None
-
-    item = models.Account(**data)
-    db.add(item)
-    db.commit()
-    db.refresh(item)
-    return item
-
-
-@router.get("/accounts", response_model=list[AccountOut])
-def list_accounts(user_id: list[int] = Query(...), db: Session = Depends(get_db)):
-    # Support multi-member listing: pass repeated user_id params (?user_id=1&user_id=2)
-    rows = (
-        db.query(models.Account)
-        .filter(models.Account.user_id.in_(user_id))
-        .order_by(models.Account.id)
-        .all()
-    )
-    return rows
-
-
-@router.patch("/accounts/{account_id}", response_model=AccountOut)
-def update_account(account_id: int, payload: AccountUpdate, db: Session = Depends(get_db)):
-    acc = db.query(models.Account).filter(models.Account.id == account_id).first()
-    if not acc:
-        raise HTTPException(status_code=404, detail="Account not found")
-    old_type = acc.type
-    old_auto_deduct = acc.auto_deduct
-    old_linked_id = acc.linked_account_id
-    if payload.name and payload.name != acc.name:
-        # 중복 이름 검증
-        dup = (
-            db.query(models.Account)
-            .filter(models.Account.user_id == acc.user_id, models.Account.name == payload.name, models.Account.id != account_id)
-            .first()
-        )
-        if dup:
-            raise HTTPException(status_code=409, detail="Account with same name already exists for user")
-    updates = payload.model_dump(exclude_unset=True)
-    if not updates:
-        return acc
-
-    new_type = updates.get("type", acc.type)
-    new_linked_id = updates.get("linked_account_id", acc.linked_account_id)
-    new_auto_deduct = bool(updates.get("auto_deduct", acc.auto_deduct))
-
-    if acc.type == models.AccountType.CREDIT_CARD and new_type != models.AccountType.CREDIT_CARD:
-        has_statements = (
-            db.query(models.CreditCardStatement)
-            .filter(models.CreditCardStatement.account_id == acc.id)
-            .count()
-        )
-        if has_statements:
-            raise HTTPException(status_code=400, detail="Cannot change type of a credit card account with statements")
-
-    if acc.type == models.AccountType.DEPOSIT and new_type != models.AccountType.DEPOSIT:
-        linked_cards = (
-            db.query(models.Account)
-            .filter(
-                models.Account.linked_account_id == acc.id,
-                models.Account.type == models.AccountType.CHECK_CARD,
-                models.Account.user_id == acc.user_id,
-            )
-            .count()
-        )
-        if linked_cards:
-            raise HTTPException(status_code=400, detail="Cannot change type of a deposit linked to CHECK_CARD accounts")
-
-    if new_type == models.AccountType.CHECK_CARD:
-        if new_linked_id:
-            if new_linked_id == acc.id:
-                raise HTTPException(status_code=400, detail="Account cannot link to itself")
-            linked = db.query(models.Account).filter(models.Account.id == new_linked_id).first()
-            if not linked or linked.user_id != acc.user_id:
-                raise HTTPException(status_code=400, detail="Linked account must belong to the same user")
-            if linked.type != models.AccountType.DEPOSIT:
-                raise HTTPException(status_code=400, detail="Linked account must be a DEPOSIT account")
-        else:
-            updates["linked_account_id"] = None
-            new_linked_id = None
-            if "auto_deduct" in updates:
-                updates["auto_deduct"] = False
-            new_auto_deduct = False
-        if new_auto_deduct and not new_linked_id:
-            raise HTTPException(status_code=400, detail="auto_deduct requires a linked deposit account")
-        desired_currency = updates.get("currency", acc.currency)
-        if new_linked_id:
-            linked = db.query(models.Account).filter(models.Account.id == new_linked_id).first()
-            if desired_currency and linked and linked.currency and desired_currency != linked.currency:
-                raise HTTPException(status_code=400, detail="CHECK_CARD currency must match linked DEPOSIT currency")
-            if not desired_currency and linked and linked.currency:
-                updates["currency"] = linked.currency
-        updates.pop("balance", None)
-        updates["balance_type"] = models.BalanceType.LINKED
-        force_zero_balance = True
-        updates["billing_cutoff_day"] = None
-        updates["payment_day"] = None
-    elif new_type == models.AccountType.CREDIT_CARD:
-        if new_linked_id is None:
-            new_linked_id = acc.linked_account_id
-        if not new_linked_id:
-            raise HTTPException(status_code=400, detail="Credit card requires a linked deposit account")
-        if new_linked_id == acc.id:
-            raise HTTPException(status_code=400, detail="Account cannot link to itself")
-        linked = db.query(models.Account).filter(models.Account.id == new_linked_id).first()
-        if not linked or linked.user_id != acc.user_id:
-            raise HTTPException(status_code=400, detail="Linked account must belong to the same user")
-        if linked.type != models.AccountType.DEPOSIT:
-            raise HTTPException(status_code=400, detail="Linked account must be a DEPOSIT account")
-        if updates.get("auto_deduct"):
-            raise HTTPException(status_code=400, detail="auto_deduct is not available for credit card accounts")
-        desired_currency = updates.get("currency", acc.currency or linked.currency)
-        if desired_currency and linked.currency and desired_currency != linked.currency:
-            raise HTTPException(status_code=400, detail="CREDIT_CARD currency must match linked DEPOSIT currency")
-        updates["currency"] = desired_currency or linked.currency
-        updates["linked_account_id"] = new_linked_id
-        updates["auto_deduct"] = False
-        updates["balance_type"] = models.BalanceType.LINKED
-        updates.pop("balance", None)
-        if "billing_cutoff_day" in updates and updates["billing_cutoff_day"] is None:
-            raise HTTPException(status_code=400, detail="billing_cutoff_day is required for credit card accounts")
-        if "payment_day" in updates and updates["payment_day"] is None:
-            raise HTTPException(status_code=400, detail="payment_day is required for credit card accounts")
-        if updates.get("billing_cutoff_day") is None and acc.billing_cutoff_day is None:
-            raise HTTPException(status_code=400, detail="billing_cutoff_day is required for credit card accounts")
-        if updates.get("payment_day") is None and acc.payment_day is None:
-            raise HTTPException(status_code=400, detail="payment_day is required for credit card accounts")
-        force_zero_balance = True
-    else:
-        # linked account is only meaningful for CHECK_CARD
-        if "linked_account_id" in updates and updates["linked_account_id"] is not None:
-            raise HTTPException(status_code=400, detail="linked_account_id is only allowed for card accounts")
-        updates["linked_account_id"] = None
-        if "auto_deduct" in updates and updates["auto_deduct"]:
-            raise HTTPException(status_code=400, detail="auto_deduct is only available for CHECK_CARD accounts")
-        updates["auto_deduct"] = False
-        updates["balance_type"] = models.BalanceType.DIRECT
-        force_zero_balance = False
-        updates["billing_cutoff_day"] = None
-        updates["payment_day"] = None
-
-    for k, v in updates.items():
-        setattr(acc, k, v)
-    if force_zero_balance:
-        acc.balance = 0.0
-    if (
-        acc.type == models.AccountType.DEPOSIT
-        and new_type == models.AccountType.DEPOSIT
-        and "currency" in updates
-    ):
-        linked_cards = (
-            db.query(models.Account)
-            .filter(
-                models.Account.linked_account_id == acc.id,
-                models.Account.type == models.AccountType.CHECK_CARD,
-                models.Account.user_id == acc.user_id,
-            )
-            .all()
-        )
-        for card in linked_cards:
-            card.currency = acc.currency
-            card.balance = 0.0
-
-    db.flush()
-
-    if old_type == models.AccountType.CHECK_CARD and acc.type != models.AccountType.CHECK_CARD:
-        _resync_check_card_auto_deduct_for_account(db, acc, force_remove=True)
-    elif acc.type == models.AccountType.CHECK_CARD:
-        if (
-            old_type != models.AccountType.CHECK_CARD
-            or old_linked_id != acc.linked_account_id
-            or old_auto_deduct != acc.auto_deduct
-        ):
-            _resync_check_card_auto_deduct_for_account(db, acc)
-
-    db.commit()
-    db.refresh(acc)
-    return acc
-
-
-@router.delete("/accounts/{account_id}", status_code=204)
-def delete_account(account_id: int, db: Session = Depends(get_db)):
-    acc = db.query(models.Account).filter(models.Account.id == account_id).first()
-    if not acc:
-        raise HTTPException(status_code=404, detail="Account not found")
-    
-    # Check if this is a deposit account linked to CHECK_CARD accounts
-    if acc.type == models.AccountType.DEPOSIT:
-        linked_check_cards = (
-            db.query(models.Account)
-            .filter(
-                models.Account.linked_account_id == acc.id,
-                models.Account.type == models.AccountType.CHECK_CARD,
-                models.Account.user_id == acc.user_id,
-            )
-            .count()
-        )
-        if linked_check_cards:
-            raise HTTPException(status_code=400, detail="Cannot delete a deposit account linked to CHECK_CARD accounts")
-        
-        # Check if this deposit account is linked to any CREDIT_CARD accounts
-        linked_credit_cards = (
-            db.query(models.Account)
-            .filter(
-                models.Account.linked_account_id == acc.id,
-                models.Account.type == models.AccountType.CREDIT_CARD,
-                models.Account.user_id == acc.user_id,
-            )
-            .count()
-        )
-        if linked_credit_cards:
-            raise HTTPException(status_code=400, detail="Cannot delete a deposit account linked to CREDIT_CARD accounts")
-    
-    # If this is a credit card account, delete all associated statements first
-    if acc.type == models.AccountType.CREDIT_CARD:
-        db.query(models.CreditCardStatement).filter(
-            models.CreditCardStatement.account_id == acc.id
-        ).delete(synchronize_session=False)
-    
-    db.delete(acc)
-    db.commit()
-    return None
-
-
-@router.post("/accounts/{account_id}/merge", response_model=AccountMergeResult)
-def merge_account(
-    account_id: int,
-    payload: AccountMergeRequest,
-    db: Session = Depends(get_db),
-):
-    if account_id == payload.target_account_id:
-        raise HTTPException(status_code=400, detail="Source and target accounts must differ")
-
-    source = db.query(models.Account).filter(models.Account.id == account_id).first()
-    if not source:
-        raise HTTPException(status_code=404, detail="Source account not found")
-
-    target = db.query(models.Account).filter(models.Account.id == payload.target_account_id).first()
-    if not target:
-        raise HTTPException(status_code=404, detail="Target account not found")
-
-    if source.user_id != target.user_id:
-        raise HTTPException(status_code=400, detail="Accounts must belong to the same user")
-
-    source_linked_cards = []
-    if source.type == models.AccountType.DEPOSIT:
-        source_linked_cards = (
-            db.query(models.Account)
-            .filter(
-                models.Account.linked_account_id == source.id,
-                models.Account.type == models.AccountType.CHECK_CARD,
-                models.Account.user_id == source.user_id,
-            )
-            .all()
-        )
-        if source_linked_cards and target.type != models.AccountType.DEPOSIT:
-            raise HTTPException(status_code=400, detail="Target account must be DEPOSIT to receive linked CHECK_CARD references")
-
-    moved_tx = (
-        db.query(models.Transaction)
-        .filter(models.Transaction.account_id == source.id)
-        .update({models.Transaction.account_id: target.id}, synchronize_session=False)
-    )
-    counter_links = (
-        db.query(models.Transaction)
-        .filter(models.Transaction.counter_account_id == source.id)
-        .update({models.Transaction.counter_account_id: target.id}, synchronize_session=False)
-    )
-    recurring_main = (
-        db.query(models.RecurringRule)
-        .filter(models.RecurringRule.account_id == source.id)
-        .update({models.RecurringRule.account_id: target.id}, synchronize_session=False)
-    )
-    recurring_counter = (
-        db.query(models.RecurringRule)
-        .filter(models.RecurringRule.counter_account_id == source.id)
-        .update({models.RecurringRule.counter_account_id: target.id}, synchronize_session=False)
-    )
-    budgets = (
-        db.query(models.Budget)
-        .filter(models.Budget.account_id == source.id)
-        .update({models.Budget.account_id: target.id}, synchronize_session=False)
-    )
-
-    if payload.combine_balances:
-        target.balance = float(target.balance or 0) + float(source.balance or 0)
-        source.balance = 0.0
-
-    if payload.archive_source:
-        source.is_archived = True
-
-    if source_linked_cards:
-        for card in source_linked_cards:
-            card.linked_account_id = target.id
-
-    db.commit()
-    db.refresh(target)
-
-    from .schemas import AccountOut as AccountOutSchema, AccountMergeResult as AccountMergeResultSchema
-    return AccountMergeResultSchema(
-        source_id=source.id,
-        target=AccountOutSchema.model_validate(target),
-        transactions_moved=moved_tx,
-        counter_links_updated=counter_links,
-        recurring_updated=recurring_main,
-        recurring_counter_updated=recurring_counter,
-        budgets_updated=budgets,
-    )
-
-
-@router.get("/accounts/{account_id}/credit-card-statements", response_model=list[CreditCardStatementOut])
-def list_credit_card_statements(
-    account_id: int,
-    user_id: int = Query(..., ge=1),
-    status: str | None = Query(None),
-    db: Session = Depends(get_db),
-):
-    account = (
-        db.query(models.Account)
-        .filter(models.Account.id == account_id, models.Account.user_id == user_id)
-        .first()
-    )
-    if not account:
-        raise HTTPException(status_code=404, detail="Account not found")
-    if account.type != models.AccountType.CREDIT_CARD:
-        raise HTTPException(status_code=400, detail="Account is not a credit card")
-
-    q = (
-        db.query(models.CreditCardStatement)
-        .filter(models.CreditCardStatement.account_id == account_id)
-        .order_by(models.CreditCardStatement.period_start.desc())
-    )
-    if status:
-        try:
-            status_enum = models.CreditCardStatementStatus(status)
-        except ValueError:
-            raise HTTPException(status_code=400, detail="Invalid statement status")
-        q = q.filter(models.CreditCardStatement.status == status_enum)
-
-    statements = q.all()
-    for stmt in statements:
-        if stmt.status != models.CreditCardStatementStatus.PAID:
-            _recalculate_statement_total(db, stmt)
-    db.flush()
-    return statements
-
-
-@router.get("/accounts/{account_id}/credit-card-summary", response_model=CreditCardAccountSummary)
-def get_credit_card_summary(
-    account_id: int,
-    user_id: int = Query(..., ge=1),
-    db: Session = Depends(get_db),
-):
-    account = (
-        db.query(models.Account)
-        .filter(models.Account.id == account_id, models.Account.user_id == user_id)
-        .first()
-    )
-    if not account:
-        raise HTTPException(status_code=404, detail="Account not found")
-    if account.type != models.AccountType.CREDIT_CARD:
-        raise HTTPException(status_code=400, detail="Account is not a credit card")
-
-    statements = (
-        db.query(models.CreditCardStatement)
-        .filter(models.CreditCardStatement.account_id == account_id)
-        .order_by(models.CreditCardStatement.period_start.desc())
-        .all()
-    )
-    active_stmt: models.CreditCardStatement | None = None
-    last_paid: models.CreditCardStatement | None = None
-    outstanding = 0.0
-    for stmt in statements:
-        if stmt.status != models.CreditCardStatementStatus.PAID:
-            _recalculate_statement_total(db, stmt)
-            outstanding += float(stmt.total_amount or 0)
-            if not active_stmt or stmt.period_end > active_stmt.period_end:
-                active_stmt = stmt
-        elif not last_paid or stmt.period_end > last_paid.period_end:
-            last_paid = stmt
-    db.flush()
-
-    linked_currency = None
-    if account.linked_account_id:
-        linked_currency = (
-            db.query(models.Account.currency)
-            .filter(models.Account.id == account.linked_account_id)
-            .scalar()
-        )
-
-    summary = CreditCardAccountSummary(
-        account_id=account.id,
-        user_id=account.user_id,
-        currency=account.currency or linked_currency,
-        outstanding_amount=outstanding,
-        next_due_date=active_stmt.due_date if active_stmt else None,
-        active_statement=CreditCardStatementOut.model_validate(active_stmt) if active_stmt else None,
-        last_paid_statement=CreditCardStatementOut.model_validate(last_paid) if last_paid else None,
-    )
-    return summary
 
 
 @router.post("/credit-card-statements/{statement_id}/settle", response_model=CreditCardStatementOut)
@@ -1834,7 +1366,7 @@ def settle_credit_card_statement(
         occurred_time=None,
         type=models.TxnType.SETTLEMENT,
         account_id=linked_account.id,
-        counter_account_id=None,
+    counter_account_id=account.id,
         card_id=account.id,
         category_id=category_id,
         amount=-outstanding,
@@ -1862,7 +1394,7 @@ def settle_credit_card_statement(
             occurred_time=None,
             type=models.TxnType.SETTLEMENT,
             account_id=account.id,
-            counter_account_id=None,
+            counter_account_id=linked_account.id,
             category_id=None,
             amount=outstanding,
             currency=card_currency,
@@ -1871,7 +1403,7 @@ def settle_credit_card_statement(
             external_id=None,
             imported_source_id=None,
             card_id=account.id,
-            is_balance_neutral=False,
+            is_balance_neutral=True,
             is_auto_transfer_match=False,
             exclude_from_reports=False,
             status=models.TransactionStatus.CLEARED,
@@ -4171,6 +3703,7 @@ def confirm_db_matches(payload: DbMatchConfirmRequest, db: Session = Depends(get
     created_count = 0
     updated_count = 0
     all_transactions = []
+    fallback_separate_items: list[TransactionCreate] = []
     
     # 결정 맵 생성 (existing_txn_id -> DbMatchDecision)
     decision_map = {d.existing_txn_id: d for d in payload.decisions}
@@ -4242,19 +3775,7 @@ def confirm_db_matches(payload: DbMatchConfirmRequest, db: Session = Depends(get
             if existing_source:
                 resolved_imported_source_id = None
         
-        # 새 transfer_group 생성 (두 트랜잭션을 연결)
-        new_group = models.TransferGroup()
-        db.add(new_group)
-        db.flush()
-        
-        # 기존 트랜잭션을 TRANSFER로 변환 (카테고리 제거, 그룹 설정)
-        existing_txn.type = models.TxnType.TRANSFER
-        existing_txn.group_id = new_group.id
-        existing_txn.category_id = None  # TRANSFER는 카테고리 없음
-        existing_txn.is_balance_neutral = False
-        existing_txn.is_auto_transfer_match = True
-        
-        # 새 항목의 counter_account 설정
+        # 새 항목의 계정 ID를 선행 해석하여 동일 계좌 케이스를 걸러낸다
         if new_item.account_id:
             new_account_id = new_item.account_id
         elif new_item.account_name:
@@ -4270,46 +3791,73 @@ def confirm_db_matches(payload: DbMatchConfirmRequest, db: Session = Depends(get
             new_account_id = account.id
         else:
             raise HTTPException(status_code=400, detail="account_id or account_name required")
-        
-        # 기존 트랜잭션의 상대 계좌 설정 (새 항목의 계좌를 상대 계좌로)
-        existing_txn.counter_account_id = new_account_id
-        
-        # 새 항목의 원본 금액 (부호 유지)
-        new_amount = float(new_item.amount)
-        
-        # 새 항목을 TRANSFER로 생성 (원본 부호 유지)
-        new_txn = models.Transaction(
-            user_id=payload.user_id,
-            occurred_at=new_item.occurred_at,
-            occurred_time=new_item.occurred_time,
-            type=models.TxnType.TRANSFER,
-            group_id=new_group.id,
-            account_id=new_account_id,
-            counter_account_id=existing_txn.account_id,
-            amount=new_amount,  # 원본 부호 유지!
-            currency=new_item.currency,
-            memo=new_item.memo,
-            external_id=resolved_external_id,
-            imported_source_id=resolved_imported_source_id,
-            is_balance_neutral=False,
-            is_auto_transfer_match=True,
-            exclude_from_reports=new_item.exclude_from_reports
-        )
-        db.add(new_txn)
 
-        # 방향 정규화: 원본 금액 부호를 기준으로 OUT/IN 결정
-        # 음수 → OUT, 양수 → IN (transfer_pairing_service의 _decide_pair_direction과 동일)
-        existing_amount = float(existing_txn.amount)
+        # 기존 전표의 기본 계좌와 동일하면 TRANSFER 불가 → 별도 생성으로 폴백
+        old_primary_account_id = existing_txn.account_id
+        if new_account_id == old_primary_account_id:
+            fallback_separate_items.append(new_item)
+            continue
         
-        # 한쪽이 음수, 한쪽이 양수면 이미 올바른 상태 (변환 불필요)
-        if (existing_amount < 0 and new_amount > 0) or (existing_amount > 0 and new_amount < 0):
-            pass  # 이미 정상 (음수=OUT, 양수=IN)
-        # 둘 다 같은 부호면 원본 데이터가 잘못된 것이므로 경고
-        # 하지만 강제 변환 시 데이터 손실 가능하므로 현재 상태 유지
-        
+    # 단일 전표 전환에는 그룹이 필수는 아님(쌍 생성이 아니므로). 중간 flush를 피한다.
+
+        # 기존 전표의 현재 상태 기록 (잔액 되돌리기용)
+        old_amount = float(existing_txn.amount)
+        old_neutral = _is_effectively_neutral_txn(existing_txn)
+        old_type = existing_txn.type
+
+        # 기존 전표의 잔액 영향 되돌리기
+        if not old_neutral:
+            if old_type == models.TxnType.TRANSFER and existing_txn.is_auto_transfer_match and existing_txn.counter_account_id:
+                _revert_single_transfer_effect(db, existing_txn.account_id, existing_txn.counter_account_id, old_amount)
+            else:
+                _apply_balance(db, old_primary_account_id, -old_amount)
+
+        # 방향/부호 결정: 단일 전표 TRANSFER로 전환 (OUT은 음수, IN은 양수)
+        new_amount = float(new_item.amount)
+        # 기본 케이스: 음수 쪽을 출금(from)으로 본다
+        if (old_amount < 0 and new_amount > 0) or (old_amount < 0 and new_amount == 0):
+            # 기존이 출금, 새 항목이 입금
+            source_account_id = old_primary_account_id
+            counter_account_id = new_account_id
+            signed_amount = -abs(old_amount)
+        elif (old_amount > 0 and new_amount < 0) or (old_amount == 0 and new_amount < 0):
+            # 기존이 입금, 새 항목이 출금
+            source_account_id = new_account_id
+            counter_account_id = old_primary_account_id
+            signed_amount = -abs(new_amount)
+        else:
+            # 둘 다 같은 부호거나 0인 비정상 케이스: 기존 부호 기준으로 보정
+            if old_amount < 0:
+                source_account_id = old_primary_account_id
+                counter_account_id = new_account_id
+                signed_amount = -abs(old_amount)
+            else:
+                source_account_id = new_account_id
+                counter_account_id = old_primary_account_id
+                signed_amount = -abs(new_amount or old_amount or 0)
+
+        # 기존 전표를 단일 TRANSFER로 재구성 (직접 컬럼 지정으로 타입 의존 하이브리드 부작용 회피)
+        existing_txn.type = models.TxnType.TRANSFER
+        existing_txn.category_id = None  # TRANSFER는 카테고리 없음
+        existing_txn.is_balance_neutral = False
+        existing_txn.is_auto_transfer_match = True
+        existing_txn.from_account_id = source_account_id
+        existing_txn.to_account_id = counter_account_id
+        existing_txn.amount = signed_amount
+
+        # 새 항목의 메모/통화 등 보존할 값이 있으면 병합(선택적으로 기존 비어있을 때만)
+        if not existing_txn.memo and new_item.memo:
+            existing_txn.memo = new_item.memo
+        if not existing_txn.currency and new_item.currency:
+            existing_txn.currency = new_item.currency
+
+        # 단일 전표 TRANSFER 잔액 반영
+        if not _is_effectively_neutral_txn(existing_txn):
+            _apply_single_transfer_effect(db, existing_txn.account_id, existing_txn.counter_account_id, float(existing_txn.amount))
+
         linked_count += 1
         updated_count += 1
-        all_transactions.extend([existing_txn, new_txn])
+        all_transactions.extend([existing_txn])
     
     # 2. 별도 거래로 등록할 항목들 처리
     separate_items = [payload.items[d.new_item_index] for d in separate_decisions]
@@ -4319,7 +3867,7 @@ def confirm_db_matches(payload: DbMatchConfirmRequest, db: Session = Depends(get
     undecided_items = [item for i, item in enumerate(payload.items) if i not in decided_indices]
     
     # 별도 등록 + 미결정 항목 합쳐서 생성
-    items_to_create = separate_items + undecided_items
+    items_to_create = separate_items + fallback_separate_items + undecided_items
     if items_to_create:
         service = TransactionBulkService(db)
         created, _ = service.bulk_create(
@@ -4344,6 +3892,10 @@ def confirm_db_matches(payload: DbMatchConfirmRequest, db: Session = Depends(get
         updated=updated_count,
         transactions=result_transactions
     )
+
+
+# Keep legacy export name for modular routers that still reference it.
+bulk_confirm_db_matches = confirm_db_matches
 
 
 @router.post("/transactions/bulk-delete", response_model=TransactionsBulkDeleteResult)
@@ -4465,6 +4017,9 @@ def bulk_move_transactions_account(payload: TransactionsBulkMoveAccount, db: Ses
         db.rollback()
 
     return TransactionsBulkMoveResult(updated=updated, missing=missing, skipped=skipped)
+
+
+bulk_move_transactions_between_accounts = bulk_move_transactions_account
 
 
 @router.post("/transactions/bulk-update", response_model=TransactionsBulkUpdateResponse)
@@ -5172,9 +4727,20 @@ def _build_account_timeline(
         amount = float(txn.amount)
         if txn.type == models.TxnType.EXPENSE:
             amount = -abs(amount)
+            grouped[txn.account_id][txn.occurred_at] += amount
         elif txn.type == models.TxnType.INCOME:
             amount = abs(amount)
-        grouped[txn.account_id][txn.occurred_at] += amount
+            grouped[txn.account_id][txn.occurred_at] += amount
+        elif txn.type == models.TxnType.TRANSFER:
+            # For transfers, attribute outflows (negative) to the source account and
+            # inflows (positive) to the destination account to avoid canceling within one series.
+            if amount < 0:
+                grouped[txn.account_id][txn.occurred_at] += amount
+            else:
+                target_acc = txn.counter_account_id or txn.account_id
+                grouped[target_acc][txn.occurred_at] += amount
+        else:
+            grouped[txn.account_id][txn.occurred_at] += amount
 
     series_list: list[AnalyticsTimelineSeries] = []
     for account_id, day_map in grouped.items():

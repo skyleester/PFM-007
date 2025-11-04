@@ -28,17 +28,23 @@ async function handleResponse<T>(res: Response, url: URL, method: string): Promi
     return undefined as T;
   }
   const text = await res.text();
-  return text ? (JSON.parse(text) as T) : (undefined as T);
+  if (!text || text.trim() === "") {
+    // Gracefully handle empty bodies (some endpoints may legitimately return no content)
+    return undefined as T;
+  }
+  try {
+    return JSON.parse(text) as T;
+  } catch (err: any) {
+    // Provide a clearer error while avoiding the raw "Unexpected end of JSON input" crash
+    const snippet = text.length > 200 ? `${text.slice(0, 200)}…` : text;
+    throw new Error(`Invalid JSON response from ${method} ${url}: ${err?.message || String(err)}. Body snippet: ${snippet}`);
+  }
 }
 
 export async function apiGet<T>(path: string, params?: Record<string, ParamValue>) {
   const url = buildUrl(path, params);
   const res = await fetch(url.toString(), { cache: 'no-store' });
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`GET ${url} failed: ${res.status} ${text}`);
-  }
-  return (await res.json()) as T;
+  return handleResponse<T>(res, url, 'GET');
 }
 
 async function apiSend<T>(path: string, init: RequestInit & { params?: Record<string, ParamValue> }) {
