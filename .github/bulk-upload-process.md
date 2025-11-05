@@ -225,6 +225,14 @@ function normalizeAccountKey(name: string): string {
 - `existingAccounts` 배열을 정규화 맵으로 변환하여 빠른 조회
 - 매칭 성공 시 기존 계좌명 사용, 실패 시 엑셀 원본명 사용
 
+#### 3.2.8 간이 업로드 파서 (`useExcelParser`)
+
+- 거래 모달에서 사용하는 경량 파서로, 고정 헤더(`날짜`, `타입`, `금액`, `결제수단` 등)를 우선 사용하고 누락 시 대표적인 한글/영문 라벨 세트를 순회한다.
+- 금액은 절대값으로 정규화하고, 음수 여부·타입 열 값을 참고해 `INCOME`/`EXPENSE`/`TRANSFER`를 추론한다.
+- `출금수단`/`입금수단`/`상대계좌`/`입출구분` 등의 컬럼을 조합해 이체의 기본 계좌, 상대 계좌, `transfer_flow`를 보강한다.
+- 명시적 상대 계좌를 결정하지 못한 TRANSFER는 백엔드 제약을 고려해 `INCOME` 또는 `EXPENSE`로 강등하며, 계좌명이 비어 있을 경우 "기타 결제수단"으로 채워 업로드 실패를 방지한다.
+- 파싱 결과는 `counter_account_name`·`transfer_flow` 메타데이터를 포함한 `ParsedTransaction` 배열로 반환되어 간단 업로드 엔드포인트(`ParsedTransactionIn`)와 바로 호환된다.
+
 ---
 
 ### 3.3 백엔드 API: POST /api/transactions/bulk
